@@ -29,6 +29,7 @@ from .ipc.protocol import AGENT_OPS, MAX_REQUEST_BYTES, ProtocolError, Request, 
 from .kernel.audit import AuditLog
 from .kernel.kernel import ROOT, CapKernel
 from .kernel.objects import ContainerObject
+from .kernel.policy import contains as policy_contains
 from .paths import ContainerPaths, db_path, force_rmtree, state_root
 from .runtime import bwrap as bwrap_mod
 from .runtime import fsprep, probe
@@ -360,6 +361,7 @@ class Daemon:
             return k.ctr_input(actor, int(args["slot"]), str(args["data"]))
         if op == "ctr.spawn":
             config = self._config_from_agent(args.get("config") or {}, actor)
+            await self._check_permission_escalation(actor, config)
             return k.ctr_spawn(actor, int(args["factory_slot"]), config)
         if op == "ds.map":
             return k.ds_map(
@@ -392,6 +394,72 @@ class Daemon:
             config.sandbox.network = False
         config.validate_sources()
         return config
+
+    async def _check_permission_escalation(
+        self, actor: str, config: ContainerConfig
+    ) -> None:
+        """Stop a container handing its child broader Claude permissions than it has.
+
+        Spawning is governed by a factory capability, but that says nothing about
+        the *tool permissions* inside the child. Without this check, a container
+        confined to `Read` could spawn a child with `Bash(*)` and act through it,
+        so the capability model would be sound while the thing it is protecting
+        walked out the back.
+
+        The child's policy is compared against the parent's envelope. Narrowing
+        -- fewer allows, more denies, allow downgraded to ask -- is provably safe
+        and passes silently. Only a genuine widening reaches the operator, and
+        even that can be pre-authorised by giving the parent an explicit
+        `permission_envelope` wider than its own permissions.
+        """
+        parent = self.containers.get(actor)
+        if parent is None:
+            return  # operator-launched: nothing to escalate from
+
+        envelope = parent.config.runtime.envelope_policy()
+        child_policy = config.runtime.permissions.to_policy()
+
+        # A child that requests nothing inherits the parent's rules, which by
+        # definition cannot escalate.
+        if child_policy.is_empty:
+            config.runtime.permissions = parent.config.runtime.permissions
+            return
+
+        diff = policy_contains(envelope, child_policy)
+        if diff.ok:
+            self.audit.record(
+                actor, "policy.check", allowed=True, target=config.name,
+                detail="child policy is within the parent's envelope",
+            )
+            return
+
+        reasons = diff.reasons()
+        self.audit.record(
+            actor, "policy.escalation", allowed=False, target=config.name,
+            detail={"reasons": reasons},
+        )
+
+        decision = await self.ask_operator(
+            actor,
+            f"{actor} wants to spawn {config.name} with wider permissions than its own",
+            {
+                "kind": "permission_escalation",
+                "child": config.name,
+                "reasons": reasons,
+                "child_policy": child_policy.to_settings(),
+                "parent_envelope": envelope.to_settings(),
+            },
+        )
+        if decision.get("decision") != "allow":
+            raise CapabilityError(
+                f"refusing to spawn {config.name}: it "
+                + "; ".join(reasons)
+                + ". The operator declined the escalation."
+            )
+        self.audit.record(
+            OPERATOR, "policy.escalation", allowed=True, target=config.name,
+            detail={"approved_for": actor},
+        )
 
     # ==================================================================
     # kernel hooks -- the effects the kernel authorises

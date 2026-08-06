@@ -164,6 +164,47 @@ class SandboxSpec(Base):
         return v
 
 
+class PermissionSpec(Base):
+    """Claude Code permission rules, set from the container's own config.
+
+    Written into the sandbox's settings.json.  Because a container can spawn
+    children, this is also an escalation surface: the child's policy is checked
+    against its parent's *envelope* before the spawn is allowed (see
+    `capwrap.kernel.policy`).
+    """
+
+    allow: list[str] = Field(default_factory=list)
+    ask: list[str] = Field(default_factory=list)
+    deny: list[str] = Field(default_factory=list)
+    #: "plan" | "default" | "acceptEdits" | "bypassPermissions".
+    default_mode: str | None = None
+
+    @field_validator("default_mode")
+    @classmethod
+    def _known_mode(cls, v: str | None) -> str | None:
+        from .kernel.policy import MODE_ORDER
+
+        if v is not None and v not in MODE_ORDER:
+            raise ValueError(f"default_mode must be one of {MODE_ORDER}, got {v!r}")
+        return v
+
+    @model_validator(mode="after")
+    def _rules_parse(self) -> "PermissionSpec":
+        from .kernel.policy import Rule
+
+        for field_name in ("allow", "ask", "deny"):
+            for text in getattr(self, field_name):
+                rule = Rule.parse(text)
+                if not rule.tool:
+                    raise ValueError(f"{field_name}: {text!r} has no tool name")
+        return self
+
+    def to_policy(self):
+        from .kernel.policy import Policy
+
+        return Policy.from_lists(self.allow, self.ask, self.deny, self.default_mode)
+
+
 class RuntimeSpec(Base):
     """What to run inside the sandbox."""
 
@@ -189,6 +230,18 @@ class RuntimeSpec(Base):
     #: argument (``"Bash(git *)"``).
     auto_allow: list[str] = Field(default_factory=list)
     auto_deny: list[str] = Field(default_factory=list)
+
+    #: Claude's own permission rules, merged into the sandbox's settings.json.
+    permissions: PermissionSpec = Field(default_factory=PermissionSpec)
+    #: The widest policy this container may give a child. Defaults to its own
+    #: permissions, so children can only ever narrow. Set it explicitly to
+    #: pre-authorise a range once instead of approving each spawn by hand.
+    permission_envelope: PermissionSpec | None = None
+
+    def envelope_policy(self):
+        """The bound on what this container may hand to a child."""
+        spec = self.permission_envelope or self.permissions
+        return spec.to_policy()
 
     @field_validator("command")
     @classmethod

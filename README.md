@@ -224,6 +224,79 @@ shell would otherwise just widen its own permissions.
 If the daemon is unreachable the hook returns `ask`, falling back to Claude's own
 prompt. It never defaults to `allow` — that would silently disable every check.
 
+### Setting Claude's permissions from the config
+
+```toml
+[runtime.permissions]
+allow        = ["Read", "Bash(git status:*)", "Bash(git diff:*)"]
+ask          = ["Write", "Edit"]
+deny         = ["Bash(sudo *)", "Bash(curl *)", "WebFetch"]
+default_mode = "default"        # plan | default | acceptEdits | bypassPermissions
+```
+
+This becomes the `permissions` block of the sandbox's `settings.json`, bound
+read-only so the agent cannot rewrite its own rules.
+
+**Why this needed a safeguard.** A container can spawn children. Nothing about a
+factory capability says anything about *tool* permissions, so a container
+confined to `Read` could spawn a child with `Bash(*)` and simply act through it
+— the capability model would still be sound while the thing it protects walked
+out the back.
+
+So permission policies get the same treatment as rights: **they may only ever be
+diminished.** A child's policy is checked against its parent's envelope before
+the spawn, using a partial order over policies (`capwrap/kernel/policy.py`):
+
+| child's change | result |
+|---|---|
+| exact copy | passes silently |
+| drops an `allow` | passes silently |
+| adds a `deny` | passes silently |
+| moves a rule `allow` → `ask` | passes silently |
+| makes a rule more specific (`Bash(git *)` → `Bash(git log *)`) | passes silently |
+| allows a new tool | **operator approval** |
+| broadens a glob (`Bash(git *)` → `Bash(*)`) | **operator approval** |
+| replaces a glob with the bare tool (`Bash(git *)` → `Bash`) | **operator approval** |
+| drops one of the parent's `deny` rules | **operator approval** |
+| allows or asks for something the parent denies | **operator approval** |
+| raises `default_mode` | **operator approval** |
+
+A child that specifies no permissions inherits the parent's, which cannot
+escalate by construction.
+
+**Making it less human-invasive.** Two things keep the operator out of the loop
+for the common cases. First, *narrowing is provably safe*, so it never prompts —
+and most real changes are narrowing. Second, `permission_envelope` lets you
+pre-authorise a range once, in the config, instead of approving each spawn:
+
+```toml
+[runtime.permissions]                 # what this container itself may do
+allow = ["Read"]
+deny  = ["Bash(sudo *)"]
+
+[runtime.permission_envelope]         # the most it may ever give a child
+allow = ["Read", "Bash(git *)"]
+deny  = ["Bash(sudo *)"]
+```
+
+Now a child asking for `Bash(git status)` starts immediately, even though the
+parent cannot run git itself; a child asking for `Bash(*)` still stops. The
+envelope defaults to the container's own permissions, so the safe behaviour is
+what you get without thinking about it.
+
+Escalations that do reach you arrive in the same approval queue as everything
+else, with the specific reason:
+
+```
+boss wants to spawn overreach with wider permissions than its own
+  - allows Bash(*), which the parent does not allow
+```
+
+**Conservative by construction.** The pattern matcher returns "not covered"
+whenever it cannot *prove* containment, so an exotic glob becomes a prompt
+rather than a silent allow. Being wrong that way costs a click; being wrong the
+other way costs the guarantee.
+
 ### Trying it
 
 ```bash
@@ -343,12 +416,12 @@ capwrap state                   where state lives, and what's in it
 capwrap/
   config.py        TOML → validated ContainerConfig
   daemon.py        containers, PTYs, sockets; implements the kernel's effects
-  kernel/          rights · captable · mapdb · objects · audit · kernel
+  kernel/          rights · captable · mapdb · objects · audit · policy · kernel
   runtime/         probe · fsprep · gitwt · bwrap · supervisor
   ipc/             protocol · per-container socket server · mailboxes
   guest/           capctl, hook.py — the only things an agent sees
   web/             FastAPI + a vanilla-JS console, xterm.js vendored locally
-tests/             81 tests; `-m sandbox` ones need a working bwrap
+tests/            130 tests; `-m sandbox` ones need a working bwrap
 ```
 
 The split that matters: `kernel/` decides what is permitted and performs no I/O;

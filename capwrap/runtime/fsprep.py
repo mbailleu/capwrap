@@ -98,6 +98,9 @@ def prepare(
 
     if config.runtime.approvals == "capwrap":
         prepared.files.extend(_install_approval_hook(config, paths))
+    elif not config.runtime.permissions.to_policy().is_empty:
+        # Permission rules apply regardless of where prompts are routed.
+        prepared.files.append(_install_permissions_only(config, paths))
 
     if config.runtime.capctl_skill:
         skill = Path(__file__).resolve().parent.parent / "guest" / "skill" / "SKILL.md"
@@ -136,7 +139,7 @@ def _install_approval_hook(
     read-only so the agent cannot widen its own permissions by editing it --
     which it would otherwise be entirely capable of doing, since it has a shell.
     """
-    settings = _stage(paths.files / "claude-settings.json", json.dumps({
+    settings: dict = {
         "hooks": {
             "PreToolUse": [{
                 "matcher": "*",
@@ -147,7 +150,16 @@ def _install_approval_hook(
                 }],
             }],
         },
-    }, indent=2) + "\n", 0o444)
+    }
+    permissions = config.runtime.permissions.to_policy().to_settings()
+    if permissions:
+        settings["permissions"] = permissions
+
+    settings_file = _stage(
+        paths.files / "claude-settings.json",
+        json.dumps(settings, indent=2) + "\n",
+        0o444,
+    )
 
     policy = _stage(paths.files / "policy.json", json.dumps({
         "allow": config.runtime.auto_allow,
@@ -158,9 +170,24 @@ def _install_approval_hook(
     # credentials) would otherwise shadow the hook registration and silently
     # disable approval routing.
     return [
-        (settings, f"{GUEST_HOME}/.claude/settings.json"),
+        (settings_file, f"{GUEST_HOME}/.claude/settings.json"),
         (policy, GUEST_POLICY),
     ]
+
+
+def _install_permissions_only(
+    config: ContainerConfig, paths: ContainerPaths
+) -> tuple[Path, str]:
+    """settings.json with permission rules but no capwrap hook."""
+    settings = _stage(
+        paths.files / "claude-settings.json",
+        json.dumps(
+            {"permissions": config.runtime.permissions.to_policy().to_settings()},
+            indent=2,
+        ) + "\n",
+        0o444,
+    )
+    return settings, f"{GUEST_HOME}/.claude/settings.json"
 
 
 def _worktree_relative(prepared: PreparedFs) -> list[str]:

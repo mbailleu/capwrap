@@ -568,3 +568,149 @@ def test_a_config_cannot_opt_out_of_the_pid_namespace(tmp_path):
             {"name": "leaky", "sandbox": {"unshare": ["ipc", "uts"]}},
             base_dir=tmp_path,
         )
+
+
+# ==========================================================================
+# permission escalation through spawning
+# ==========================================================================
+
+
+def spawn_request(name: str, permissions: dict) -> dict:
+    return {
+        "factory_slot": 3,
+        "config": {"name": name, "runtime": {"permissions": permissions}},
+    }
+
+
+async def parent_with_factory(daemon, tmp_path, *, permissions, envelope=None):
+    runtime = {"permissions": permissions}
+    if envelope is not None:
+        runtime["permission_envelope"] = envelope
+    daemon.register(config(
+        "boss", tmp_path,
+        runtime=runtime,
+        caps={"factory": {"rights": ["create"], "quota": {"containers": 5}}},
+    ))
+    container = daemon.containers["boss"]
+    container.server = await daemon._serve_container(container)
+    # Spawning must not actually launch a sandbox in these tests.
+    daemon.spawn_container = lambda cfg, parent: daemon.register(cfg, parent=parent).obj
+    return container
+
+
+async def test_a_narrower_child_spawns_without_asking_anyone(daemon, tmp_path):
+    container = await parent_with_factory(
+        daemon, tmp_path,
+        permissions={"allow": ["Read", "Bash(git *)"], "deny": ["Bash(sudo *)"]},
+    )
+    reply = await request(container.paths.socket, "ctr.spawn", spawn_request(
+        "child", {"allow": ["Read"], "deny": ["Bash(sudo *)"]},
+    ))
+    assert reply.ok, reply.message
+    assert not daemon.pending_approvals(), "narrowing must never reach the operator"
+
+
+async def test_a_child_inherits_the_parents_permissions_when_it_asks_for_none(
+    daemon, tmp_path
+):
+    permissions = {"allow": ["Read"], "deny": ["Bash(sudo *)"]}
+    container = await parent_with_factory(daemon, tmp_path, permissions=permissions)
+
+    reply = await request(container.paths.socket, "ctr.spawn", {
+        "factory_slot": 3, "config": {"name": "child"},
+    })
+    assert reply.ok, reply.message
+    child = daemon.containers["child"]
+    assert child.config.runtime.permissions.allow == ["Read"]
+    assert child.config.runtime.permissions.deny == ["Bash(sudo *)"]
+
+
+async def test_a_wider_child_is_blocked_until_the_operator_agrees(daemon, tmp_path):
+    """The hole this whole mechanism exists to close.
+
+    A container confined to Read tries to spawn a child that can run anything --
+    which would let it act through the child. The factory capability alone says
+    nothing about tool permissions, so without this check the spawn succeeds.
+    """
+    container = await parent_with_factory(
+        daemon, tmp_path, permissions={"allow": ["Read"], "deny": ["Bash(sudo *)"]},
+    )
+
+    spawning = asyncio.ensure_future(request(
+        container.paths.socket, "ctr.spawn",
+        spawn_request("overreach", {"allow": ["Read", "Bash(*)"],
+                                    "deny": ["Bash(sudo *)"]}),
+    ))
+    await asyncio.sleep(0.1)
+
+    pending = daemon.pending_approvals()
+    assert len(pending) == 1, "the escalation did not reach the operator"
+    assert pending[0]["context"]["kind"] == "permission_escalation"
+    assert any("Bash(*)" in r for r in pending[0]["context"]["reasons"])
+
+    daemon.resolve_approval(pending[0]["id"], "deny", "no")
+    reply = await asyncio.wait_for(spawning, timeout=5)
+
+    assert not reply.ok
+    assert "operator declined" in (reply.message or "")
+    assert "overreach" not in daemon.containers
+
+
+async def test_the_operator_can_approve_an_escalation(daemon, tmp_path):
+    container = await parent_with_factory(
+        daemon, tmp_path, permissions={"allow": ["Read"]},
+    )
+    spawning = asyncio.ensure_future(request(
+        container.paths.socket, "ctr.spawn",
+        spawn_request("wider", {"allow": ["Read", "Write"]}),
+    ))
+    await asyncio.sleep(0.1)
+
+    pending = daemon.pending_approvals()
+    daemon.resolve_approval(pending[0]["id"], "allow", "this one is fine")
+    reply = await asyncio.wait_for(spawning, timeout=5)
+
+    assert reply.ok, reply.message
+    assert "wider" in daemon.containers
+
+
+async def test_an_envelope_pre_authorises_a_range(daemon, tmp_path):
+    """The less human-invasive route: decide once in the config, not per spawn."""
+    container = await parent_with_factory(
+        daemon, tmp_path,
+        permissions={"allow": ["Read"], "deny": ["Bash(sudo *)"]},
+        envelope={"allow": ["Read", "Bash(git *)"], "deny": ["Bash(sudo *)"]},
+    )
+
+    # Inside the envelope, though beyond the parent's own policy: no prompt.
+    reply = await request(container.paths.socket, "ctr.spawn", spawn_request(
+        "helper", {"allow": ["Read", "Bash(git status)"], "deny": ["Bash(sudo *)"]},
+    ))
+    assert reply.ok, reply.message
+    assert not daemon.pending_approvals()
+
+    # Beyond the envelope: still stops.
+    spawning = asyncio.ensure_future(request(
+        container.paths.socket, "ctr.spawn",
+        spawn_request("greedy", {"allow": ["Bash(*)"], "deny": ["Bash(sudo *)"]}),
+    ))
+    await asyncio.sleep(0.1)
+    assert daemon.pending_approvals()
+    daemon.resolve_approval(daemon.pending_approvals()[0]["id"], "deny", "")
+    await asyncio.wait_for(spawning, timeout=5)
+
+
+async def test_escalation_attempts_are_audited(daemon, tmp_path):
+    container = await parent_with_factory(
+        daemon, tmp_path, permissions={"allow": ["Read"]},
+    )
+    spawning = asyncio.ensure_future(request(
+        container.paths.socket, "ctr.spawn",
+        spawn_request("nope", {"allow": ["Bash"]}),
+    ))
+    await asyncio.sleep(0.1)
+    daemon.resolve_approval(daemon.pending_approvals()[0]["id"], "deny", "")
+    await asyncio.wait_for(spawning, timeout=5)
+
+    entries = daemon.audit.tail(limit=40)
+    assert any(e["op"] == "policy.escalation" and not e["allowed"] for e in entries)
