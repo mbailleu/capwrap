@@ -197,7 +197,8 @@ capctl grant peer:dev-b 3 --rights read     # delegate, diminished
 capctl revoke 3                    # take back everything I gave from slot 3
 capctl map peer:dev-b 3 findings   # put a dataspace in their /shared
 capctl spawn factory child.toml    # create a child, within quota
-capctl ask "may I install curl?"   # ask the human, and block for an answer
+capctl ask "may I install curl?"   # ask the human (a question, not a grant)
+capctl request factory --quota 2   # ask for authority; approval grants it
 ```
 
 ### Identity
@@ -327,6 +328,40 @@ Every container gets a Claude Code skill at
 question without it being repeated in every prompt. Turn it off with
 `[runtime] capctl_skill = false`.
 
+## Asking for a capability, vs. asking a question
+
+`capctl ask` is a *question*. Approving it tells the agent "yes" and performs
+nothing — so an agent that asks "may I have a factory?" and is told **allow**
+still has an unchanged capability table. That is confusing enough that agents
+report it as a bug.
+
+`capctl request` closes the loop: the approval **is** the grant.
+
+```bash
+capctl request factory --quota 2 --reason "need a helper to run the test suite"
+capctl request container dev-b --rights send,inspect --reason "report results"
+capctl request dataspace /srv/data --rights read
+```
+
+The operator gets a card with the reason and a rights picker showing the rights
+that are meaningful for that object kind, and **Grant** performs the delegation
+atomically. The agent's blocked call returns the new slot, usable immediately:
+
+```
+granted: slot 3 "factory" with create
+```
+
+The operator can hand back **less** than was asked for — tick fewer rights and
+that is what gets delegated. Denying grants nothing. Everything granted this way
+is an ordinary mapping-database entry, so it is audited and recursively
+revocable like any other.
+
+Naming a container in a request is not a hole in "no ambient authority": the
+agent still cannot *act* on anything it holds no slot for. It is asking a human,
+and the human resolves the name and decides. A request is not a reference.
+
+`examples/agents/request-demo.toml` shows both side by side.
+
 ## Granting authority while things are running
 
 Capabilities are not frozen at spawn. In the **Capabilities** tab, select a
@@ -368,6 +403,14 @@ capwrap clean <name> --yes
 ```
 
 ---
+
+## Console layout
+
+The three columns are resizable: drag the splitters, double-click one to reset,
+or focus it and use the arrow keys (Shift for bigger steps). Widths persist in
+`localStorage`, and the terminal reflows as you drag rather than snapping at the
+end. Only viewports under 720px drop a column, and it is the container list —
+never the inbox, which is where approvals arrive.
 
 ## Reaching the console from another machine
 
@@ -421,7 +464,7 @@ capwrap/
   ipc/             protocol · per-container socket server · mailboxes
   guest/           capctl, hook.py — the only things an agent sees
   web/             FastAPI + a vanilla-JS console, xterm.js vendored locally
-tests/            130 tests; `-m sandbox` ones need a working bwrap
+tests/            137 tests; `-m sandbox` ones need a working bwrap
 ```
 
 The split that matters: `kernel/` decides what is permitted and performs no I/O;

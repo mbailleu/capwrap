@@ -26,6 +26,7 @@ AGENT_OPS = frozenset({
     "cap.info",
     "cap.delegate",
     "cap.revoke",
+    "cap.request",
     "msg.send",
     "msg.recv",
     "ctr.status",

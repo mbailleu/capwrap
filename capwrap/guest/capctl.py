@@ -281,6 +281,34 @@ def cmd_map(args):
         print(f"{result['recipient']} can now read it at {result['path']}")
 
 
+def cmd_request(args):
+    """Ask the operator for a capability. Approval performs the grant."""
+    result = call(
+        "cap.request",
+        {
+            "kind": args.kind,
+            "target": args.target or "",
+            "rights": args.rights.split(",") if args.rights else [],
+            "quota": args.quota,
+            "reason": args.reason or "",
+            "timeout": args.timeout,
+        },
+        timeout=None,
+    )
+    if args.json:
+        emit(result, True)
+    elif result.get("granted"):
+        print(
+            f"granted: slot {result['slot']} \"{result['label']}\" "
+            f"with {','.join(result['rights'])}"
+        )
+    else:
+        reason = result.get("reason") or ""
+        print(f"{result.get('decision', 'denied')}{': ' + reason if reason else ''}")
+    if not result.get("granted"):
+        sys.exit(1)
+
+
 def cmd_ask(args):
     result = call(
         "ask",
@@ -386,6 +414,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", choices=["copy", "map"], default="copy",
                    help="copy duplicates the bytes; map aliases them")
     p.set_defaults(func=cmd_map)
+
+    p = sub.add_parser(
+        "request",
+        help="ask the operator for a capability; approval grants it immediately",
+    )
+    p.add_argument("kind", choices=["container", "dataspace", "factory"])
+    p.add_argument("target", nargs="?",
+                   help="container name or host path; omit for a factory")
+    p.add_argument("--rights", help="comma-separated; defaults to send,inspect")
+    p.add_argument("--quota", type=int, default=1,
+                   help="for a factory: how many containers it may create")
+    p.add_argument("--reason", help="why you need it -- the operator reads this")
+    p.add_argument("--timeout", type=float, default=None)
+    p.set_defaults(func=cmd_request)
 
     p = sub.add_parser("ask", help="ask the human operator, and wait for an answer")
     p.add_argument("question")

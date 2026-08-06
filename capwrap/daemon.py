@@ -30,12 +30,20 @@ from .kernel.audit import AuditLog
 from .kernel.kernel import ROOT, CapKernel
 from .kernel.objects import ContainerObject
 from .kernel.policy import contains as policy_contains
+from .kernel.rights import VALID_RIGHTS, Rights, parse_rights
 from .paths import ContainerPaths, db_path, force_rmtree, state_root
 from .runtime import bwrap as bwrap_mod
 from .runtime import fsprep, probe
 from .runtime.supervisor import PtySession
 
 OPERATOR = "operator"
+
+#: What an agent gets if it requests a capability without naming rights.
+DEFAULT_REQUEST_RIGHTS = {
+    "container": Rights.SEND | Rights.INSPECT,
+    "dataspace": Rights.READ,
+    "factory": Rights.CREATE,
+}
 
 
 class PendingApproval:
@@ -368,6 +376,16 @@ class Daemon:
                 actor, int(args["target_slot"]), int(args["ds_slot"]),
                 str(args["dest"]), str(args.get("mode", "copy")),
             )
+        if op == "cap.request":
+            return await self.request_capability(
+                actor,
+                kind=str(args.get("kind", "container")),
+                target=str(args.get("target", "")),
+                rights=args.get("rights") or [],
+                quota=int(args.get("quota", 1)),
+                reason=str(args.get("reason", "")),
+                timeout=args.get("timeout"),
+            )
         if op == "ask":
             return await self.ask_operator(
                 actor, str(args["question"]), args.get("context") or {},
@@ -593,12 +611,105 @@ class Daemon:
         finally:
             self.approvals.pop(pending.id, None)
 
-    def resolve_approval(self, approval_id: int, decision: str, reason: str = "") -> bool:
-        """Answer a pending question from the web UI."""
+    async def request_capability(
+        self,
+        actor: str,
+        kind: str,
+        target: str,
+        rights: list[str],
+        quota: int = 1,
+        reason: str = "",
+        timeout: float | None = None,
+    ) -> dict:
+        """Ask the operator for a capability, and receive it if they agree.
+
+        `capctl ask` returns a *string*: approving it tells the agent "yes" but
+        performs nothing, so an agent that asked for a factory and was told
+        "allow" still had an unchanged capability table. This closes that loop --
+        the approval itself does the delegation, atomically, and the agent gets
+        back the slot number it can immediately use.
+
+        Naming a container here is not a hole in "no ambient authority". An agent
+        still cannot *act* on anything it has no slot for; it is asking a human
+        to grant one, and the human is the one who resolves the name and decides.
+        A request is not a reference.
+
+        The operator may grant narrower rights than were asked for; whatever they
+        return is what gets delegated.
+        """
+        if kind not in DEFAULT_REQUEST_RIGHTS:
+            raise CapabilityError(
+                f"cannot request a capability of kind {kind!r}; "
+                f"expected {', '.join(sorted(DEFAULT_REQUEST_RIGHTS))}"
+            )
+        # Defaults have to match the kind: `send` means nothing on a factory,
+        # and the kernel would reject the grant after the operator had already
+        # clicked approve.
+        requested = parse_rights(rights) if rights else DEFAULT_REQUEST_RIGHTS[kind]
+
+        self.audit.record(
+            actor, "cap.request", allowed=True, target=target,
+            rights=str(requested), detail={"kind": kind, "reason": reason},
+        )
+
+        decision = await self.ask_operator(
+            actor,
+            f"{actor} requests a {kind} capability"
+            + (f" on {target}" if target else "")
+            + (f": {reason}" if reason else ""),
+            {
+                "kind": "capability_request",
+                "request": {
+                    "kind": kind,
+                    "target": target,
+                    "rights": requested.names(),
+                    "quota": quota,
+                    "reason": reason,
+                    # So the approval card offers the rights that apply to this
+                    # kind, rather than a container-shaped list every time.
+                    "valid_rights": VALID_RIGHTS[kind].names(),
+                },
+            },
+            timeout=timeout,
+        )
+
+        if decision.get("decision") != "allow":
+            self.audit.record(
+                actor, "cap.request", allowed=False, target=target,
+                detail=decision.get("reason") or "declined",
+            )
+            return {
+                "granted": False,
+                "decision": decision.get("decision", "denied"),
+                "reason": decision.get("reason", ""),
+            }
+
+        # The operator can hand back a narrower set than was asked for.
+        granted = parse_rights(decision["rights"]) if decision.get("rights") else requested
+        result = self.kernel.operator_grant(
+            actor, kind, target, granted, quota=quota
+        )
+        self._emit("cap.granted", {"container": actor, **result})
+        return {"granted": True, "decision": "allow", **result}
+
+    def resolve_approval(
+        self,
+        approval_id: int,
+        decision: str,
+        reason: str = "",
+        rights: list[str] | None = None,
+    ) -> bool:
+        """Answer a pending question from the web UI.
+
+        `rights` is only meaningful for a capability request, where it lets the
+        operator grant less than was asked for.
+        """
         pending = self.approvals.get(approval_id)
         if pending is None or pending.future.done():
             return False
-        pending.future.set_result({"decision": decision, "reason": reason})
+        pending.future.set_result(
+            {"decision": decision, "reason": reason, "rights": rights}
+        )
         self.kernel.audit.record(
             OPERATOR, "approval.resolve", allowed=(decision == "allow"),
             target=pending.container, detail={"decision": decision, "reason": reason},

@@ -714,3 +714,162 @@ async def test_escalation_attempts_are_audited(daemon, tmp_path):
 
     entries = daemon.audit.tail(limit=40)
     assert any(e["op"] == "policy.escalation" and not e["allowed"] for e in entries)
+
+
+# ==========================================================================
+# capability requests -- approval that actually grants
+# ==========================================================================
+
+
+async def test_ask_alone_grants_nothing(daemon, tmp_path):
+    """`capctl ask` is a question, not a request.
+
+    Approving it tells the agent "yes" and changes nothing, which is exactly the
+    confusion `cap.request` exists to remove.
+    """
+    daemon.register(config("solo", tmp_path))
+    c = daemon.containers["solo"]
+    c.server = await daemon._serve_container(c)
+
+    before = len(daemon.kernel.tasks["solo"])
+    asking = asyncio.ensure_future(
+        request(c.paths.socket, "ask", {"question": "may I have a factory?"})
+    )
+    await asyncio.sleep(0.05)
+    daemon.resolve_approval(daemon.pending_approvals()[0]["id"], "allow", "sure")
+    reply = await asyncio.wait_for(asking, timeout=5)
+
+    assert reply.result["decision"] == "allow"
+    assert len(daemon.kernel.tasks["solo"]) == before, \
+        "ask must not change the capability table"
+
+
+async def test_a_granted_request_lands_in_the_cap_table(daemon, tmp_path):
+    daemon.register(config("solo", tmp_path))
+    daemon.register(config("peer", tmp_path))
+    c = daemon.containers["solo"]
+    c.server = await daemon._serve_container(c)
+
+    asking = asyncio.ensure_future(request(c.paths.socket, "cap.request", {
+        "kind": "container", "target": "peer",
+        "rights": ["send", "inspect"], "reason": "need to report results",
+    }))
+    await asyncio.sleep(0.05)
+
+    pending = daemon.pending_approvals()[0]
+    assert pending["context"]["kind"] == "capability_request"
+    assert pending["context"]["request"]["target"] == "peer"
+    assert pending["context"]["request"]["reason"] == "need to report results"
+
+    daemon.resolve_approval(pending["id"], "allow")
+    reply = await asyncio.wait_for(asking, timeout=5)
+
+    assert reply.ok and reply.result["granted"] is True
+    slot = reply.result["slot"]
+
+    # The agent can use it immediately, without restarting or being told twice.
+    caps = (await request(c.paths.socket, "cap.list")).result
+    granted = [x for x in caps if x["slot"] == slot][0]
+    assert granted["label"] == "peer:peer"
+    assert sorted(granted["rights"]) == ["inspect", "send"]
+
+    sent = await request(c.paths.socket, "msg.send",
+                         {"slot": slot, "payload": "hello"})
+    assert sent.ok
+
+
+async def test_the_operator_can_grant_less_than_was_asked_for(daemon, tmp_path):
+    """Asking for kill should not mean getting kill."""
+    daemon.register(config("solo", tmp_path))
+    daemon.register(config("peer", tmp_path))
+    c = daemon.containers["solo"]
+    c.server = await daemon._serve_container(c)
+
+    asking = asyncio.ensure_future(request(c.paths.socket, "cap.request", {
+        "kind": "container", "target": "peer",
+        "rights": ["send", "inspect", "kill"],
+    }))
+    await asyncio.sleep(0.05)
+    daemon.resolve_approval(
+        daemon.pending_approvals()[0]["id"], "allow", "", rights=["send"],
+    )
+    reply = await asyncio.wait_for(asking, timeout=5)
+
+    assert reply.result["rights"] == ["send"]
+    with pytest.raises(Exception):
+        daemon.kernel.ctr_kill("solo", reply.result["slot"])
+
+
+async def test_a_denied_request_grants_nothing(daemon, tmp_path):
+    daemon.register(config("solo", tmp_path))
+    daemon.register(config("peer", tmp_path))
+    c = daemon.containers["solo"]
+    c.server = await daemon._serve_container(c)
+    before = len(daemon.kernel.tasks["solo"])
+
+    asking = asyncio.ensure_future(request(c.paths.socket, "cap.request", {
+        "kind": "container", "target": "peer", "rights": ["send"],
+    }))
+    await asyncio.sleep(0.05)
+    daemon.resolve_approval(daemon.pending_approvals()[0]["id"], "deny", "no")
+    reply = await asyncio.wait_for(asking, timeout=5)
+
+    assert reply.ok and reply.result["granted"] is False
+    assert len(daemon.kernel.tasks["solo"]) == before
+
+
+async def test_requesting_a_factory_makes_spawning_work(daemon, tmp_path):
+    """The exact case that prompted this: an agent with no factory asks for one."""
+    daemon.register(config("solo", tmp_path))
+    c = daemon.containers["solo"]
+    c.server = await daemon._serve_container(c)
+    daemon.spawn_container = lambda cfg, parent: daemon.register(cfg, parent=parent).obj
+
+    assert not any(x.kind == "factory" for x in daemon.kernel.cap_list("solo"))
+
+    asking = asyncio.ensure_future(request(c.paths.socket, "cap.request", {
+        "kind": "factory", "rights": ["create"], "quota": 2,
+        "reason": "I need a helper to run the test suite",
+    }))
+    await asyncio.sleep(0.05)
+    daemon.resolve_approval(daemon.pending_approvals()[0]["id"], "allow",
+                            rights=["create"])
+    reply = await asyncio.wait_for(asking, timeout=5)
+    assert reply.result["granted"]
+
+    factory_slot = reply.result["slot"]
+    spawned = await request(c.paths.socket, "ctr.spawn", {
+        "factory_slot": factory_slot, "config": {"name": "helper"},
+    })
+    assert spawned.ok, spawned.message
+    assert "helper" in daemon.containers
+
+
+async def test_a_requested_capability_is_still_revocable(daemon, tmp_path):
+    """Nothing granted this way escapes the mapping database."""
+    daemon.register(config("solo", tmp_path))
+    daemon.register(config("peer", tmp_path))
+    c = daemon.containers["solo"]
+    c.server = await daemon._serve_container(c)
+
+    asking = asyncio.ensure_future(request(c.paths.socket, "cap.request", {
+        "kind": "container", "target": "peer", "rights": ["send"],
+    }))
+    await asyncio.sleep(0.05)
+    daemon.resolve_approval(daemon.pending_approvals()[0]["id"], "allow")
+    slot = (await asyncio.wait_for(asking, timeout=5)).result["slot"]
+
+    node = daemon.kernel.tasks["solo"].slots[slot].node
+    daemon.kernel._apply_revocations(daemon.kernel.mapdb.revoke(node))
+    assert slot not in daemon.kernel.tasks["solo"].slots
+
+
+async def test_an_unknown_request_kind_is_refused(daemon, tmp_path):
+    daemon.register(config("solo", tmp_path))
+    c = daemon.containers["solo"]
+    c.server = await daemon._serve_container(c)
+
+    reply = await request(c.paths.socket, "cap.request",
+                          {"kind": "root", "target": "everything"})
+    assert not reply.ok
+    assert not daemon.pending_approvals(), "a bad kind must not reach the operator"

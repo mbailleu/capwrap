@@ -46,7 +46,7 @@ from .objects import (
     KernelObject,
     new_oid,
 )
-from .rights import VALID_RIGHTS, Rights, parse_rights
+from .rights import VALID_RIGHTS, Rights, parse_rights, validate_for
 
 #: The operator's task.  Holds a root capability on every object, which is what
 #: makes "revoke anything from the web UI" always possible.
@@ -132,6 +132,19 @@ class CapInfo:
             "rights": self.rights,
             "detail": self.detail,
         }
+
+
+def _unique_label(task: Task, base: str) -> str:
+    """`peer:x`, then `peer:x#2`, ... -- labels are how agents address a slot,
+    so a second capability on the same object must not collide with the first.
+    """
+    taken = {ref.label for ref in task.slots.values()}
+    if base not in taken:
+        return base
+    n = 2
+    while f"{base}#{n}" in taken:
+        n += 1
+    return f"{base}#{n}"
 
 
 class CapKernel:
@@ -679,6 +692,56 @@ class CapKernel:
                           detail=question[:200])
         self.hooks.deliver_message(self.operator_gate.label, message)
         return {"asked": True}
+
+    def operator_grant(
+        self,
+        holder_name: str,
+        kind: str,
+        target: str,
+        rights: Rights,
+        quota: int = 0,
+        label: str | None = None,
+    ) -> dict:
+        """Mint a capability into `holder_name`'s table, on the operator's say-so.
+
+        The one place authority enters the system from outside. Reached from the
+        web UI's grant button and from an approved `cap.request`; never from an
+        agent directly, because it delegates from the root task rather than from
+        the caller.
+        """
+        task = self.tasks.get(holder_name)
+        if task is None:
+            raise NoSuchCapability(f"unknown container {holder_name!r}")
+
+        if kind == "container":
+            obj = self.find_container(target)
+            if obj is None:
+                raise NoSuchCapability(f"no such container: {target}")
+            default_label = f"peer:{target}"
+        elif kind == "dataspace":
+            obj = self.create_dataspace(Path(target))
+            default_label = target
+        elif kind == "factory":
+            obj = self.create_factory(f"{holder_name}-factory", quota)
+            default_label = "factory"
+        else:
+            raise CapabilityError(f"cannot grant a capability of kind {kind!r}")
+
+        rights = validate_for(obj.kind, rights)
+        slot = self._delegate_from_root(
+            task, obj.oid, rights, label=_unique_label(task, label or default_label)
+        )
+        self.audit.record(
+            ROOT, "cap.operator_grant", allowed=True, target=holder_name,
+            slot=slot, rights=str(rights), detail={"kind": kind, "object": target},
+        )
+        return {
+            "holder": holder_name,
+            "slot": slot,
+            "kind": kind,
+            "label": task.slots[slot].label,
+            "rights": rights.names(),
+        }
 
     # -- reporting -------------------------------------------------------
 

@@ -58,12 +58,42 @@ body {
 .topbar-right { display: flex; align-items: center; gap: 10px; }
 
 /* ---------------------------------------------------------------- layout */
+/* Side column widths live in custom properties so the resizers can set them
+   from JS without rewriting the whole template. */
+:root {
+  --sidebar-w: 260px;
+  --inbox-w: 320px;
+  --gutter: 6px;
+}
+
 .layout {
   flex: 1 1 auto;
   display: grid;
-  grid-template-columns: 260px minmax(0, 1fr) 320px;
+  grid-template-columns:
+    var(--sidebar-w) var(--gutter) minmax(0, 1fr) var(--gutter) var(--inbox-w);
   min-height: 0;
 }
+
+/* ---------------------------------------------------------------- resizers */
+.resizer {
+  cursor: col-resize;
+  background: var(--border);
+  position: relative;
+  /* The visible line is thin, but the grab area needs to be forgiving. */
+  border-left: 2px solid transparent;
+  border-right: 2px solid transparent;
+  background-clip: padding-box;
+  touch-action: none;
+}
+.resizer:hover,
+.resizer:focus-visible,
+.resizer.dragging { background-color: var(--accent); outline: none; }
+.resizer:focus-visible { border-color: var(--accent); }
+
+/* While dragging, stop the pointer from selecting text or being stolen by the
+   terminal underneath. */
+body.resizing { cursor: col-resize; user-select: none; }
+body.resizing iframe, body.resizing .terminal-host { pointer-events: none; }
 .sidebar, .inbox {
   background: var(--bg-raised);
   padding: 14px;
@@ -317,9 +347,14 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 
 .empty { color: var(--text-dim); font-size: 12.5px; padding: 10px 0; }
 
-@media (max-width: 1100px) {
-  .layout { grid-template-columns: 210px minmax(0, 1fr); }
-  .inbox { display: none; }
+/* Only genuinely tiny viewports drop a column, and it is the container list --
+   never the inbox, which is where approvals arrive. Above this the columns are
+   yours to size. */
+@media (max-width: 720px) {
+  .layout {
+    grid-template-columns: 0 0 minmax(0, 1fr) var(--gutter) var(--inbox-w);
+  }
+  .sidebar, #resize-sidebar { display: none; }
 }
 
 /* ---------------------------------------------------------------- granting */

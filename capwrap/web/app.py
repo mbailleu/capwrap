@@ -49,6 +49,8 @@ class SendBody(BaseModel):
 class ApprovalBody(BaseModel):
     decision: str
     reason: str = ""
+    #: Only for a capability request: grant narrower rights than were asked for.
+    rights: list[str] | None = None
 
 
 class RevokeBody(BaseModel):
@@ -215,7 +217,9 @@ def create_app(daemon: Daemon) -> FastAPI:
     async def resolve(approval_id: int, body: ApprovalBody) -> dict:
         if body.decision not in ("allow", "deny"):
             raise HTTPException(400, "decision must be 'allow' or 'deny'")
-        if not daemon.resolve_approval(approval_id, body.decision, body.reason):
+        if not daemon.resolve_approval(
+            approval_id, body.decision, body.reason, body.rights
+        ):
             raise HTTPException(404, "no such pending approval")
         return {"id": approval_id, "decision": body.decision}
 
@@ -237,35 +241,10 @@ def create_app(daemon: Daemon) -> FastAPI:
     @app.post("/api/caps/grant")
     async def grant(body: GrantBody) -> dict:
         """Hand a container a new capability on another container, at runtime."""
-        holder = daemon.kernel.tasks.get(body.holder)
-        target = daemon.kernel.find_container(body.target_container)
-        if holder is None:
-            raise HTTPException(404, f"no such task: {body.holder}")
-        if target is None:
-            raise HTTPException(404, f"no such container: {body.target_container}")
-        # Labels are how an agent addresses a capability (`capctl send peer:x`),
-        # so a second grant on the same container must not collide with the
-        # first -- otherwise every `capctl` call naming it fails as ambiguous.
-        label = body.label or _unique_label(holder, f"peer:{body.target_container}")
-        slot = daemon.kernel._delegate_from_root(
-            holder, target.oid, parse_rights(body.rights), label=label,
+        return daemon.kernel.operator_grant(
+            body.holder, "container", body.target_container,
+            parse_rights(body.rights), label=body.label,
         )
-        daemon.audit.record(
-            OPERATOR, "cap.grant", allowed=True, target=body.holder, slot=slot,
-            rights=",".join(body.rights),
-        )
-        return {"holder": body.holder, "slot": slot, "rights": body.rights,
-                "label": label}
-
-    def _unique_label(holder, base: str) -> str:
-        """`peer:x`, then `peer:x#2`, `peer:x#3`, ... within one cap table."""
-        taken = {ref.label for ref in holder.slots.values()}
-        if base not in taken:
-            return base
-        n = 2
-        while f"{base}#{n}" in taken:
-            n += 1
-        return f"{base}#{n}"
 
     # ------------------------------------------------------------------
     # live streams

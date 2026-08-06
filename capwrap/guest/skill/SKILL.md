@@ -42,6 +42,25 @@ non-zero for deny — so `capctl ask "..." && do-the-thing` does the right thing
 Use this whenever you are about to do something you are not sure is wanted.
 The operator sees every agent's questions in one queue, so asking is cheap.
 
+## Asking for a capability you do not have
+
+`capctl ask` is only a question — the operator saying "allow" tells you yes but
+changes nothing. If you need *authority* you do not hold, request it:
+
+```
+capctl request factory --quota 2 --reason "need a helper to run the test suite"
+capctl request container dev-b --rights send,inspect --reason "report results"
+capctl request dataspace /srv/data --rights read
+```
+
+Approving the request performs the grant, so on success the capability is
+already in your table and usable immediately — check with `capctl caps`. The
+operator may give you narrower rights than you asked for; the command prints
+what you actually got and exits non-zero if it was refused.
+
+Naming a container here is not cheating: you are asking a human, and they decide.
+It is asking to *act* on something you hold no capability for that is impossible.
+
 ## Talking to other agents
 
 ```

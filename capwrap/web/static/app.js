@@ -61,6 +61,95 @@ function applyTerminalTheme() {
     : { background: '#0a0d12', foreground: '#d7dee8', cursor: '#4c9aff' };
 }
 
+// ------------------------------------------------------------------ resizing
+
+// Which CSS variable each splitter drives, which way it grows, and the range it
+// is allowed to move in.
+const PANELS = {
+  'resize-sidebar': { varName: '--sidebar-w', from: 'left', min: 150, max: 560, def: 260 },
+  'resize-inbox': { varName: '--inbox-w', from: 'right', min: 200, max: 900, def: 320 },
+};
+
+const clamp = (value, lo, hi) => Math.min(hi, Math.max(lo, value));
+
+function setPanelWidth(id, px, { persist = true } = {}) {
+  const spec = PANELS[id];
+  const width = Math.round(clamp(px, spec.min, spec.max));
+  document.documentElement.style.setProperty(spec.varName, `${width}px`);
+  if (persist) localStorage.setItem(`capwrap-${spec.varName}`, String(width));
+  return width;
+}
+
+function initResizers() {
+  // Restore whatever the operator chose last time.
+  for (const [id, spec] of Object.entries(PANELS)) {
+    const saved = Number(localStorage.getItem(`capwrap-${spec.varName}`));
+    if (saved) setPanelWidth(id, saved, { persist: false });
+  }
+
+  for (const id of Object.keys(PANELS)) {
+    const handle = $(id);
+    if (!handle) continue;
+    const spec = PANELS[id];
+
+    handle.addEventListener('pointerdown', (event) => {
+      event.preventDefault();
+      // Capture on the handle so the drag survives the pointer crossing the
+      // terminal, which would otherwise swallow the move events.
+      handle.setPointerCapture(event.pointerId);
+      handle.classList.add('dragging');
+      document.body.classList.add('resizing');
+
+      const onMove = (move) => {
+        const width = spec.from === 'left'
+          ? move.clientX
+          : window.innerWidth - move.clientX;
+        setPanelWidth(id, width);
+        // Reflow the terminal as the column moves, so it tracks the drag
+        // instead of snapping when you let go.
+        requestAnimationFrame(fitTerminal);
+      };
+
+      const onUp = () => {
+        handle.releasePointerCapture(event.pointerId);
+        handle.classList.remove('dragging');
+        document.body.classList.remove('resizing');
+        handle.removeEventListener('pointermove', onMove);
+        handle.removeEventListener('pointerup', onUp);
+        handle.removeEventListener('pointercancel', onUp);
+        // The PTY only needs telling once, at the end.
+        syncTerminalSize();
+      };
+
+      handle.addEventListener('pointermove', onMove);
+      handle.addEventListener('pointerup', onUp);
+      handle.addEventListener('pointercancel', onUp);
+    });
+
+    handle.addEventListener('dblclick', () => {
+      setPanelWidth(id, spec.def);
+      syncTerminalSize();
+    });
+
+    // Keyboard access, so the layout is not mouse-only.
+    handle.addEventListener('keydown', (event) => {
+      const step = event.shiftKey ? 40 : 10;
+      const current = parseInt(
+        getComputedStyle(document.documentElement).getPropertyValue(spec.varName), 10,
+      ) || spec.def;
+      const grow = spec.from === 'left' ? 1 : -1;
+
+      if (event.key === 'ArrowLeft') setPanelWidth(id, current - step * grow);
+      else if (event.key === 'ArrowRight') setPanelWidth(id, current + step * grow);
+      else if (event.key === 'Home') setPanelWidth(id, spec.def);
+      else return;
+
+      event.preventDefault();
+      syncTerminalSize();
+    });
+  }
+}
+
 // ------------------------------------------------------------------ tree
 
 function statusOf(container) {
@@ -130,17 +219,24 @@ function initTerminal() {
     }
   });
 
-  const resize = () => {
-    if (!fitAddon) return;
-    try { fitAddon.fit(); } catch (_) { /* not visible yet */ }
-    if (termSocket && termSocket.readyState === WebSocket.OPEN) {
-      termSocket.send(JSON.stringify({
-        type: 'resize', cols: term.cols, rows: term.rows,
-      }));
-    }
-  };
-  window.addEventListener('resize', resize);
-  setTimeout(resize, 50);
+  window.addEventListener('resize', syncTerminalSize);
+  setTimeout(syncTerminalSize, 50);
+}
+
+/** Reflow xterm to its container. Cheap enough to call during a drag. */
+function fitTerminal() {
+  if (!fitAddon) return;
+  try { fitAddon.fit(); } catch (_) { /* panel not visible yet */ }
+}
+
+/** Reflow, then tell the PTY its new size so the agent's TUI redraws to match. */
+function syncTerminalSize() {
+  fitTerminal();
+  if (term && termSocket && termSocket.readyState === WebSocket.OPEN) {
+    termSocket.send(JSON.stringify({
+      type: 'resize', cols: term.cols, rows: term.rows,
+    }));
+  }
 }
 
 function openTerminal(name) {
@@ -161,10 +257,7 @@ function openTerminal(name) {
     }
     term.write(new Uint8Array(event.data));
   };
-  socket.onopen = () => setTimeout(() => {
-    try { fitAddon.fit(); } catch (_) { /* ignore */ }
-    socket.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
-  }, 30);
+  socket.onopen = () => setTimeout(syncTerminalSize, 30);
   socket.onclose = () => {
     if (termContainer === name) term.writeln('\r\n\x1b[90m[disconnected]\x1b[0m');
   };
@@ -341,8 +434,46 @@ function renderApprovals() {
   }
 
   host.innerHTML = state.approvals.map((approval) => {
-    const context = approval.context && Object.keys(approval.context).length
-      ? `<div class="ctx">${escapeHtml(JSON.stringify(approval.context, null, 2))}</div>`
+    const ctx = approval.context || {};
+
+    // A capability request is answered by *granting*, not by saying yes: the
+    // approval performs the delegation, and the operator can trim the rights
+    // on the way through.
+    if (ctx.kind === 'capability_request') {
+      const req = ctx.request || {};
+      const asked = new Set(req.rights || []);
+      // Offer the rights that mean something for this object kind, not a
+      // container-shaped list regardless of what was asked for.
+      const choices = req.valid_rights && req.valid_rights.length
+        ? req.valid_rights
+        : GRANTABLE.map((r) => r.name);
+      const boxes = [...new Set(choices)].map((name) => `
+        <label class="check" title="${escapeHtml(name)}">
+          <input type="checkbox" value="${escapeHtml(name)}"
+                 ${asked.has(name) ? 'checked' : ''}>
+          <span class="right${STRONG_RIGHTS.has(name) ? ' strong' : ''}">${escapeHtml(name)}</span>
+        </label>`).join('');
+
+      return `
+        <div class="approval" data-request="${approval.id}">
+          <div class="who">${escapeHtml(approval.container)} · capability request</div>
+          <div class="q">
+            wants a <strong>${escapeHtml(req.kind || '?')}</strong> capability
+            ${req.target ? `on <span class="mono">${escapeHtml(req.target)}</span>` : ''}
+            ${req.kind === 'factory' ? `(quota ${Number(req.quota) || 1})` : ''}
+          </div>
+          ${req.reason ? `<div class="ctx">${escapeHtml(req.reason)}</div>` : ''}
+          <div class="rights-picker">${boxes}</div>
+          <div class="actions">
+            <button class="primary small" data-grant="${approval.id}">Grant</button>
+            <button class="small danger" data-deny="${approval.id}">Deny</button>
+            <button class="ghost small" data-goto="${escapeHtml(approval.container)}">Open</button>
+          </div>
+        </div>`;
+    }
+
+    const context = Object.keys(ctx).length
+      ? `<div class="ctx">${escapeHtml(JSON.stringify(ctx, null, 2))}</div>`
       : '';
     return `
       <div class="approval">
@@ -357,18 +488,28 @@ function renderApprovals() {
       </div>`;
   }).join('');
 
-  const resolve = async (id, decision) => {
+  const resolve = async (id, decision, rights = null) => {
     try {
       await api(`/api/approvals/${id}`, {
         method: 'POST',
-        body: JSON.stringify({ decision, reason: '' }),
+        body: JSON.stringify({ decision, reason: '', rights }),
       });
       state.approvals = state.approvals.filter((a) => a.id !== id);
       renderApprovals();
+      if (state.selected) loadCaps(state.selected);
     } catch (err) {
       alert(`Could not answer: ${err.message}`);
     }
   };
+
+  host.querySelectorAll('[data-grant]').forEach((b) =>
+    b.addEventListener('click', () => {
+      const card = b.closest('.approval');
+      const rights = [...card.querySelectorAll('.rights-picker input:checked')]
+        .map((i) => i.value);
+      if (!rights.length) return alert('Pick at least one right, or Deny.');
+      resolve(Number(b.dataset.grant), 'allow', rights);
+    }));
 
   host.querySelectorAll('[data-allow]').forEach((b) =>
     b.addEventListener('click', () => resolve(Number(b.dataset.allow), 'allow')));
@@ -522,9 +663,7 @@ function showTab(name) {
     gridTimer = setInterval(renderGrid, 1500);
   }
   if (name === 'audit') renderAudit();
-  if (name === 'terminal' && fitAddon) {
-    setTimeout(() => { try { fitAddon.fit(); } catch (_) { /* ignore */ } }, 30);
-  }
+  if (name === 'terminal') setTimeout(syncTerminalSize, 30);
 }
 
 // ------------------------------------------------------------------ events
@@ -640,6 +779,7 @@ function wire() {
 }
 
 initTheme();
+initResizers();
 initTerminal();
 wire();
 connect();

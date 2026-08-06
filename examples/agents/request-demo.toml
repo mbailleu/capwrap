@@ -1,0 +1,30 @@
+# Shows the difference between asking and requesting.
+#
+#   capwrap up examples/agents/request-demo.toml
+#   # open http://127.0.0.1:8420 -- two items appear in the approval queue
+#
+# The first is a plain question: approving it says "yes" and changes nothing.
+# The second is a capability request: approving it performs the grant, and the
+# agent can use the result immediately.
+
+name = "reqdemo"
+
+[runtime]
+command = ["/bin/bash", "-c", """
+echo '=== what I hold at startup:'
+capctl caps
+echo
+echo '=== 1. capctl ask -- a question. Approving it changes nothing.'
+capctl ask 'may I have a factory?' || true
+capctl caps
+echo
+echo '=== 2. capctl request -- approving it grants the capability.'
+capctl request factory --quota 2 --reason 'need a helper to run the test suite'
+echo
+echo '=== caps now:'
+capctl caps
+echo
+echo '=== and the factory works:'
+printf '{"name": "helper", "runtime": {"command": ["/bin/sleep", "30"]}}' > /tmp/child.json
+capctl spawn factory /tmp/child.json
+"""]
