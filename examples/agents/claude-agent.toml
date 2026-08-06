@@ -1,0 +1,111 @@
+# A real Claude Code agent, on its own branch, with its permission prompts
+# routed to the capwrap web console instead of its own terminal.
+#
+#   capwrap up examples/agents/claude-agent.toml
+#   # then open http://127.0.0.1:8420
+#
+# Note the network is on: Claude needs to reach the API. Everything else is
+# still confined -- it can only see /work, /ref and /scratch.
+
+name = "claude-a"
+
+[runtime]
+# An absolute path, because /usr is bound read-only and nothing new can be
+# created under it -- the binary is mounted at /opt/claude below instead.
+command = ["/opt/claude/claude"]
+cwd     = "/work"
+tty     = true
+notify  = "file"
+
+# Divert every tool-permission prompt to the operator's inbox, so several
+# agents' prompts queue in one list instead of each blocking in its own window.
+approvals = "capwrap"
+
+# Things not worth waking a human for. Everything else still asks.
+auto_allow = [
+  "Read",
+  "Glob",
+  "Grep",
+  "TodoWrite",
+  "Bash(git status*)",
+  "Bash(git diff*)",
+  "Bash(git log*)",
+  "Bash(ls *)",
+]
+auto_deny = [
+  "Bash(sudo *)",
+  "Bash(curl *)",
+]
+
+[runtime.env]
+# Claude keeps credentials in HOME, which is per-container state on the host.
+TERM = "xterm-256color"
+
+[sandbox]
+base     = "host-ro"
+network  = true          # the API is not reachable without it
+hostname = "claude-a"
+unshare  = ["pid", "ipc", "uts", "cgroup"]
+
+# The claude binary itself. It is a self-contained ELF, and ~/.local/bin/claude
+# is a symlink to the current version, so this keeps working across updates.
+[[mounts]]
+src  = "~/.local/bin/claude"
+dest = "/opt/claude/claude"
+mode = "ro"
+
+# Credentials, as a *private copy* rather than a bind: claude refreshes its
+# OAuth token, and each container should own its own copy of that rather than
+# racing the host and every sibling agent over one file.
+#
+# This does hand the sandbox your Anthropic credentials -- which is the point,
+# since the agent has to reach the API, but it is the one genuinely sensitive
+# thing crossing the boundary. Drop these two mounts and the agent will simply
+# ask you to log in inside its own terminal instead.
+[[mounts]]
+src  = "~/.claude"
+dest = "/home/agent/.claude"
+mode = "copy"
+
+[[mounts]]
+src  = "~/.claude.json"
+dest = "/home/agent/.claude.json"
+mode = "copy"
+
+[[mounts]]
+src        = "~/capwrap-demo/repo"
+dest       = "/work"
+mode       = "worktree"
+share      = "objects"
+branch     = "capwrap/claude-a"
+base       = "main"
+on_destroy = "keep"
+
+[[mounts]]
+src  = "~/capwrap-demo/ref"
+dest = "/ref"
+mode = "ro"
+
+[[mounts]]
+dest = "/scratch"
+mode = "tmpfs"
+size = "256m"
+
+[[files]]
+dest    = "/work/CLAUDE.md"
+content = """
+You are running inside a capwrap container on branch `capwrap/claude-a`.
+
+- Work only in /work. It is your own git worktree; commit freely.
+- /ref is read-only reference material.
+- /scratch is temporary and disappears with the container.
+
+You can talk to other agents and to the operator:
+  capctl caps                       what you are allowed to do
+  capctl send <label> "<message>"   message another agent
+  capctl recv                       read your mailbox
+  capctl ask "<question>"           ask the human, and wait for an answer
+"""
+
+[caps]
+parent = ["send"]

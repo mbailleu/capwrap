@@ -1,0 +1,70 @@
+# AppArmor profile for a nix-installed bubblewrap.
+#
+# Ubuntu enables kernel.apparmor_restrict_unprivileged_userns=1, which forces any
+# *unconfined* program that creates a user namespace into the `unprivileged_userns`
+# profile.  That profile contains `audit deny capability`, so the process ends up
+# with no real capabilities inside its own userns and bwrap fails at its first step:
+#
+#     bwrap: setting up uid map: Permission denied
+#
+# Ubuntu ships /etc/apparmor.d/bwrap-userns-restrict to exempt bubblewrap, but it
+# attaches by path to /usr/bin/bwrap only.  A nix-store bwrap is therefore not
+# covered.  This profile is that same policy re-attached to the nix store path.
+#
+# The attachment uses a glob so it keeps matching when the store hash changes on a
+# nixpkgs update.  Both the plain path and the .../bin/bwrap under a home-manager
+# profile resolve to /nix/store/<hash>-bubblewrap-<version>/bin/bwrap.
+#
+# Install with scripts/install-apparmor-profile.sh.
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile bwrap_nix /nix/store/*-bubblewrap-*/bin/bwrap flags=(attach_disconnected,mediate_deleted) {
+  allow capability,
+  # Not `allow all`, so that the pix stack below still works on systems without
+  # rule priority support.  'm' is needed everywhere for children under profile
+  # stacking.
+  allow file rwlkm /{**,},
+  allow network,
+  allow unix,
+  allow ptrace,
+  allow signal,
+  allow mqueue,
+  allow io_uring,
+  allow userns,
+  allow mount,
+  allow umount,
+  allow pivot_root,
+  allow dbus,
+
+  # Stack the sandboxed child against unpriv_bwrap_nix so that processes *inside*
+  # the sandbox get no capabilities, even though bwrap itself needs them.
+  # This is what keeps bwrap from being a generic bypass of the userns restriction.
+  allow pix /** -> &bwrap_nix//&unpriv_bwrap_nix,
+
+  include if exists <local/capwrap-bwrap-nix>
+}
+
+# Strips capabilities from everything running inside the sandbox.
+profile unpriv_bwrap_nix flags=(attach_disconnected,mediate_deleted) {
+  allow file rwlkm /{**,},
+  allow network,
+  allow unix,
+  allow ptrace,
+  allow signal,
+  allow mqueue,
+  allow io_uring,
+  allow userns,
+  allow mount,
+  allow umount,
+  allow pivot_root,
+  allow dbus,
+
+  allow pix /** -> &unpriv_bwrap_nix,
+
+  audit deny capability,
+
+  include if exists <local/capwrap-unpriv-bwrap-nix>
+}

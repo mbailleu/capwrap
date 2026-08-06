@@ -1,0 +1,3 @@
+#!/bin/sh
+# Wrapper so agents can just run `capctl` from PATH inside a sandbox.
+exec /usr/bin/env python3 "$(dirname "$(readlink -f "$0")")/capctl.py" "$@"

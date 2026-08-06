@@ -1,0 +1,7 @@
+.venv/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+
+# Machine-local tool state, not project configuration.
+.claude/settings.local.json

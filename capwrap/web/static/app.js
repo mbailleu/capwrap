@@ -1,0 +1,645 @@
+/* capwrap operator UI.
+ *
+ * One WebSocket carries every system event; a second one is opened per
+ * container for its terminal. State lives in `state` and the DOM is re-rendered
+ * from it, which is plenty for a handful of agents and keeps the whole thing
+ * readable without a framework.
+ */
+
+'use strict';
+
+const state = {
+  containers: [],
+  tree: [],
+  approvals: [],
+  messages: [],
+  selected: null,
+  caps: {},
+};
+
+let term = null;
+let fitAddon = null;
+let termSocket = null;
+let termContainer = null;
+
+const $ = (id) => document.getElementById(id);
+const api = async (path, options) => {
+  const res = await fetch(path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...options,
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || body.detail || `${res.status} ${res.statusText}`);
+  }
+  return res.status === 204 ? null : res.json();
+};
+
+const escapeHtml = (value) =>
+  String(value ?? '').replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+
+// ------------------------------------------------------------------ theme
+
+function initTheme() {
+  const saved = localStorage.getItem('capwrap-theme');
+  if (saved) document.documentElement.setAttribute('data-theme', saved);
+  $('theme-toggle').addEventListener('click', () => {
+    const next = document.documentElement.getAttribute('data-theme') === 'light'
+      ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('capwrap-theme', next);
+    if (term) applyTerminalTheme();
+  });
+}
+
+function applyTerminalTheme() {
+  const light = document.documentElement.getAttribute('data-theme') === 'light';
+  term.options.theme = light
+    ? { background: '#eceff3', foreground: '#1d2330', cursor: '#0a66d0' }
+    : { background: '#0a0d12', foreground: '#d7dee8', cursor: '#4c9aff' };
+}
+
+// ------------------------------------------------------------------ tree
+
+function statusOf(container) {
+  if (container.running) return 'running';
+  return container.state || 'created';
+}
+
+function renderTree() {
+  const host = $('tree');
+  if (!state.tree.length) {
+    host.innerHTML = '<div class="empty">No containers registered.</div>';
+    return;
+  }
+
+  const byName = Object.fromEntries(state.containers.map((c) => [c.name, c]));
+
+  const node = (entry) => {
+    const live = byName[entry.name] || entry;
+    const status = statusOf(live);
+    const selected = state.selected === entry.name ? ' selected' : '';
+    const kids = (entry.children || []).map(node).join('');
+    return `
+      <div>
+        <div class="node${selected}" data-name="${escapeHtml(entry.name)}">
+          <span class="dot ${status}"></span>
+          <span class="name">${escapeHtml(entry.name)}</span>
+          <span class="meta">${entry.caps ?? 0} caps</span>
+        </div>
+        ${kids ? `<div class="children">${kids}</div>` : ''}
+      </div>`;
+  };
+
+  host.innerHTML = state.tree.map(node).join('');
+  host.querySelectorAll('.node').forEach((el) => {
+    el.addEventListener('click', () => select(el.dataset.name));
+  });
+}
+
+function renderComposeTargets() {
+  const select = $('compose-target');
+  const previous = select.value;
+  select.innerHTML = state.containers
+    .map((c) => `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`)
+    .join('');
+  if (previous) select.value = previous;
+}
+
+// ------------------------------------------------------------------ terminal
+
+function initTerminal() {
+  term = new Terminal({
+    fontFamily: 'ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace',
+    fontSize: 13,
+    cursorBlink: true,
+    scrollback: 5000,
+    convertEol: false,
+  });
+  fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open($('terminal'));
+  applyTerminalTheme();
+
+  // Keystrokes go straight down the socket; the agent sees a real terminal.
+  term.onData((data) => {
+    if (termSocket && termSocket.readyState === WebSocket.OPEN) {
+      termSocket.send(JSON.stringify({ type: 'input', data }));
+    }
+  });
+
+  const resize = () => {
+    if (!fitAddon) return;
+    try { fitAddon.fit(); } catch (_) { /* not visible yet */ }
+    if (termSocket && termSocket.readyState === WebSocket.OPEN) {
+      termSocket.send(JSON.stringify({
+        type: 'resize', cols: term.cols, rows: term.rows,
+      }));
+    }
+  };
+  window.addEventListener('resize', resize);
+  setTimeout(resize, 50);
+}
+
+function openTerminal(name) {
+  if (termSocket) { termSocket.close(); termSocket = null; }
+  term.reset();
+  termContainer = name;
+  $('term-title').textContent = name;
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const socket = new WebSocket(`${proto}//${location.host}/ws/terminal/${name}`);
+  socket.binaryType = 'arraybuffer';
+
+  socket.onmessage = (event) => {
+    if (typeof event.data === 'string') {
+      const payload = JSON.parse(event.data);
+      if (payload.type === 'error') term.writeln(`\r\n\x1b[33m${payload.message}\x1b[0m`);
+      return;
+    }
+    term.write(new Uint8Array(event.data));
+  };
+  socket.onopen = () => setTimeout(() => {
+    try { fitAddon.fit(); } catch (_) { /* ignore */ }
+    socket.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+  }, 30);
+  socket.onclose = () => {
+    if (termContainer === name) term.writeln('\r\n\x1b[90m[disconnected]\x1b[0m');
+  };
+  termSocket = socket;
+}
+
+async function select(name, { focusTerminal = false } = {}) {
+  // Switch tabs *before* opening the socket: xterm measures its container when
+  // it fits, and a hidden panel has no dimensions, so opening a terminal into a
+  // display:none panel leaves it stuck at the default 80x24.
+  if (focusTerminal) showTab('terminal');
+  state.selected = name;
+  $('grant-form').hidden = true;
+  renderTree();
+  openTerminal(name);
+  await loadCaps(name);
+}
+
+// ------------------------------------------------------------------ caps
+
+async function loadCaps(name) {
+  try {
+    state.caps[name] = await api(`/api/caps/${name}`);
+  } catch (err) {
+    state.caps[name] = [];
+  }
+  renderCaps();
+}
+
+// Rights that let the holder disrupt another container get highlighted, since
+// those are the ones worth noticing in a glance.
+const STRONG_RIGHTS = new Set(['kill', 'signal', 'write_input', 'write', 'create', 'map']);
+
+function renderCaps() {
+  const name = state.selected;
+  $('caps-title').textContent = name ? `capabilities held by ${name}` : 'capabilities';
+  const caps = state.caps[name] || [];
+  const host = $('caps');
+
+  if (!caps.length) {
+    host.innerHTML = '<div class="empty">Select a container to see what it may do.</div>';
+    return;
+  }
+
+  const rows = caps.map((cap) => {
+    const rights = cap.rights
+      .map((r) => `<span class="right${STRONG_RIGHTS.has(r) ? ' strong' : ''}">${r}</span>`)
+      .join('');
+    const detail = cap.detail || {};
+    const extra = detail.path || detail.state
+      || (detail.remaining !== undefined ? `${detail.remaining} spawns left` : '');
+    return `
+      <tr>
+        <td class="mono">${cap.slot}</td>
+        <td>${escapeHtml(cap.kind)}</td>
+        <td class="mono">${escapeHtml(cap.label)}</td>
+        <td>${rights}</td>
+        <td class="muted small">${escapeHtml(extra)}</td>
+        <td><button class="ghost small danger" data-revoke="${cap.slot}">Revoke</button></td>
+      </tr>`;
+  }).join('');
+
+  host.innerHTML = `
+    <div class="cap-group">
+      <table>
+        <thead><tr>
+          <th>Slot</th><th>Kind</th><th>Label</th><th>Rights</th><th></th><th></th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <p class="muted small">
+        Revoking is recursive: anything this container passed on derived from the
+        same capability dies with it.
+      </p>
+    </div>`;
+
+  host.querySelectorAll('[data-revoke]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const slot = Number(button.dataset.revoke);
+      if (!confirm(`Revoke slot ${slot} from ${name}, and everything derived from it?`)) return;
+      try {
+        const result = await api('/api/caps/revoke', {
+          method: 'POST',
+          body: JSON.stringify({ container: name, slot, include_self: true }),
+        });
+        alert(`Revoked ${result.revoked} mapping(s). Affected: ${result.holders.join(', ') || 'nobody'}`);
+        await loadCaps(name);
+      } catch (err) {
+        alert(`Revoke failed: ${err.message}`);
+      }
+    });
+  });
+}
+
+// ------------------------------------------------------------------ granting
+
+// What the operator can hand out on a container capability. Ordered so the
+// least alarming come first; `kill` and `write_input` are the ones that let the
+// holder actually disrupt its neighbour, so they are not pre-ticked.
+const GRANTABLE = [
+  { name: 'send', on: true, hint: 'post messages to it' },
+  { name: 'inspect', on: true, hint: 'see that it exists and its status' },
+  { name: 'read_output', on: false, hint: 'read its terminal output' },
+  { name: 'delegate', on: false, hint: 'pass this capability on to others' },
+  { name: 'signal', on: false, hint: 'interrupt it' },
+  { name: 'write_input', on: false, hint: 'type at its terminal' },
+  { name: 'kill', on: false, hint: 'terminate it' },
+];
+
+function renderGrantForm() {
+  const holder = state.selected;
+  if (!holder) return;
+  $('grant-holder').textContent = holder;
+
+  // You cannot usefully grant a container a capability on itself.
+  $('grant-target').innerHTML = state.containers
+    .filter((c) => c.name !== holder)
+    .map((c) => `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`)
+    .join('') || '<option value="">(no other containers)</option>';
+
+  $('grant-rights').innerHTML = GRANTABLE.map((r) => `
+    <label class="check" title="${escapeHtml(r.hint)}">
+      <input type="checkbox" value="${r.name}" ${r.on ? 'checked' : ''}>
+      <span class="right${STRONG_RIGHTS.has(r.name) ? ' strong' : ''}">${r.name}</span>
+    </label>`).join('');
+}
+
+function wireGrant() {
+  const form = $('grant-form');
+
+  $('btn-grant').addEventListener('click', () => {
+    if (!state.selected) return alert('Select a container first.');
+    renderGrantForm();
+    form.hidden = !form.hidden;
+  });
+  $('grant-cancel').addEventListener('click', () => { form.hidden = true; });
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const holder = state.selected;
+    const target = $('grant-target').value;
+    const rights = [...$('grant-rights').querySelectorAll('input:checked')]
+      .map((i) => i.value);
+    if (!target) return;
+    if (!rights.length) return alert('Pick at least one right.');
+
+    try {
+      const result = await api('/api/caps/grant', {
+        method: 'POST',
+        body: JSON.stringify({
+          holder, target_container: target, rights,
+        }),
+      });
+      form.hidden = true;
+      await loadCaps(holder);
+      alert(`${holder} now holds slot ${result.slot} on ${target} (${rights.join(', ')}).`);
+    } catch (err) {
+      alert(`Grant failed: ${err.message}`);
+    }
+  });
+}
+
+// ------------------------------------------------------------------ approvals
+
+function renderApprovals() {
+  const host = $('approvals');
+  $('approval-count').textContent = state.approvals.length;
+  $('approval-count').className = state.approvals.length
+    ? 'pill pill-warn' : 'pill pill-quiet';
+
+  if (!state.approvals.length) {
+    host.innerHTML = '<div class="empty">Nothing waiting on you.</div>';
+    return;
+  }
+
+  host.innerHTML = state.approvals.map((approval) => {
+    const context = approval.context && Object.keys(approval.context).length
+      ? `<div class="ctx">${escapeHtml(JSON.stringify(approval.context, null, 2))}</div>`
+      : '';
+    return `
+      <div class="approval">
+        <div class="who">${escapeHtml(approval.container)}</div>
+        <div class="q">${escapeHtml(approval.question)}</div>
+        ${context}
+        <div class="actions">
+          <button class="primary small" data-allow="${approval.id}">Allow</button>
+          <button class="small danger" data-deny="${approval.id}">Deny</button>
+          <button class="ghost small" data-goto="${escapeHtml(approval.container)}">Open</button>
+        </div>
+      </div>`;
+  }).join('');
+
+  const resolve = async (id, decision) => {
+    try {
+      await api(`/api/approvals/${id}`, {
+        method: 'POST',
+        body: JSON.stringify({ decision, reason: '' }),
+      });
+      state.approvals = state.approvals.filter((a) => a.id !== id);
+      renderApprovals();
+    } catch (err) {
+      alert(`Could not answer: ${err.message}`);
+    }
+  };
+
+  host.querySelectorAll('[data-allow]').forEach((b) =>
+    b.addEventListener('click', () => resolve(Number(b.dataset.allow), 'allow')));
+  host.querySelectorAll('[data-deny]').forEach((b) =>
+    b.addEventListener('click', () => resolve(Number(b.dataset.deny), 'deny')));
+  host.querySelectorAll('[data-goto]').forEach((b) =>
+    b.addEventListener('click', () => select(b.dataset.goto, { focusTerminal: true })));
+}
+
+function renderMessages() {
+  const host = $('messages');
+  if (!state.messages.length) {
+    host.innerHTML = '<div class="empty">No messages yet.</div>';
+    return;
+  }
+  host.innerHTML = state.messages.slice(-40).reverse().map((m) => {
+    const body = typeof m.payload === 'string'
+      ? m.payload : JSON.stringify(m.payload);
+    return `
+      <div class="message">
+        <div class="from">${escapeHtml(m.from)} → operator</div>
+        <div>${escapeHtml(body)}</div>
+      </div>`;
+  }).join('');
+}
+
+// ------------------------------------------------------------------ grid
+
+// Rows shown per tile. Enough to see a prompt plus its last output.
+const TILE_ROWS = 14;
+
+// pyte reports colours by name; map them onto the palette the terminal uses so
+// a tile and its full-size terminal look like the same program.
+const ANSI_COLORS = {
+  black: '#22262e', red: '#f85149', green: '#3fb950', brown: '#d29922',
+  yellow: '#d29922', blue: '#4c9aff', magenta: '#bc8cff', cyan: '#39c5cf',
+  white: '#d7dee8',
+  brightblack: '#6e7681', brightred: '#ff7b72', brightgreen: '#56d364',
+  brightbrown: '#e3b341', brightyellow: '#e3b341', brightblue: '#79b8ff',
+  brightmagenta: '#d2a8ff', brightcyan: '#56d4dd', brightwhite: '#f0f6fc',
+};
+
+const cssColor = (name) =>
+  ANSI_COLORS[name] || (/^[0-9a-f]{6}$/i.test(name) ? `#${name}` : null);
+
+/** One screen row of styled runs → HTML. */
+function renderRow(runs) {
+  if (!runs || !runs.length) return '';
+  return runs.map((run) => {
+    const text = escapeHtml(run.t);
+    const styles = [];
+    // `reverse` swaps fg and bg — that is how selected items and status bars
+    // are drawn, so ignoring it makes them vanish rather than merely lose colour.
+    const fg = cssColor(run.r ? (run.b || 'white') : run.f);
+    const bg = cssColor(run.r ? (run.f || 'black') : run.b);
+    if (fg) styles.push(`color:${fg}`);
+    if (bg) styles.push(`background:${bg}`);
+    if (run.o) styles.push('font-weight:600');
+    return styles.length
+      ? `<span style="${styles.join(';')}">${text}</span>`
+      : text;
+  }).join('');
+}
+
+async function renderGrid() {
+  const host = $('grid');
+  const running = state.containers.filter((c) => c.running);
+  if (!running.length) {
+    host.innerHTML = '<div class="empty">No agents are running.</div>';
+    return;
+  }
+  host.innerHTML = running.map((c) => `
+    <div class="tile" data-name="${escapeHtml(c.name)}">
+      <div class="tile-head">
+        <span class="dot running"></span>${escapeHtml(c.name)}
+      </div>
+      <pre id="tile-${escapeHtml(c.name)}">loading…</pre>
+    </div>`).join('');
+
+  host.querySelectorAll('.tile').forEach((tile) => {
+    tile.addEventListener('click', () =>
+      select(tile.dataset.name, { focusTerminal: true }));
+  });
+
+  // Snapshots come from the daemon's pyte model, so a full-screen TUI renders
+  // correctly instead of showing a half-replayed redraw. We ask for the *tail*:
+  // a shell sits at the bottom of its screen, so the top rows are the least
+  // interesting part to put in a small tile.
+  await Promise.all(running.map(async (container) => {
+    try {
+      const screen = await api(
+        `/api/containers/${container.name}/screen?rows=${TILE_ROWS}`);
+      const element = $(`tile-${container.name}`);
+      if (!element) return;
+      element.innerHTML = screen.styled && screen.styled.length
+        ? screen.styled.map(renderRow).join('\n')
+        : '<span class="muted">(no output yet)</span>';
+    } catch (_) { /* container may have exited mid-refresh */ }
+  }));
+}
+
+
+// ------------------------------------------------------------------ audit
+
+async function renderAudit() {
+  const denied = $('audit-denied').checked;
+  const rows = await api(`/api/audit?limit=150&denied=${denied}`);
+  const host = $('audit');
+  if (!rows.length) {
+    host.innerHTML = '<div class="empty">Nothing logged yet.</div>';
+    return;
+  }
+  host.innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Time</th><th>Actor</th><th>Operation</th><th>Target</th>
+        <th>Slot</th><th>Rights</th><th>Result</th>
+      </tr></thead>
+      <tbody>
+        ${rows.map((r) => `
+          <tr>
+            <td class="muted small">${new Date(r.ts * 1000).toLocaleTimeString()}</td>
+            <td class="mono">${escapeHtml(r.actor)}</td>
+            <td class="mono">${escapeHtml(r.op)}</td>
+            <td class="mono">${escapeHtml(r.target || '')}</td>
+            <td class="mono">${r.slot ?? ''}</td>
+            <td class="muted small">${escapeHtml(r.rights || '')}</td>
+            <td>${r.allowed
+              ? '<span class="pill pill-ok">allowed</span>'
+              : '<span class="pill pill-bad">denied</span>'}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+// ------------------------------------------------------------------ tabs
+
+let gridTimer = null;
+
+function showTab(name) {
+  document.querySelectorAll('.tabs button').forEach((b) =>
+    b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('.tab-panel').forEach((p) =>
+    p.classList.toggle('active', p.id === `tab-${name}`));
+
+  // Only poll while the overview is actually visible.
+  clearInterval(gridTimer);
+  gridTimer = null;
+  if (name === 'grid') {
+    renderGrid();
+    gridTimer = setInterval(renderGrid, 1500);
+  }
+  if (name === 'audit') renderAudit();
+  if (name === 'terminal' && fitAddon) {
+    setTimeout(() => { try { fitAddon.fit(); } catch (_) { /* ignore */ } }, 30);
+  }
+}
+
+// ------------------------------------------------------------------ events
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const socket = new WebSocket(`${proto}//${location.host}/ws/events`);
+
+  socket.onopen = () => {
+    $('conn').textContent = 'live';
+    $('conn').className = 'pill pill-ok';
+  };
+  socket.onclose = () => {
+    $('conn').textContent = 'reconnecting…';
+    $('conn').className = 'pill pill-bad';
+    setTimeout(connect, 2000);
+  };
+  socket.onmessage = (raw) => handleEvent(JSON.parse(raw.data));
+}
+
+function handleEvent(event) {
+  switch (event.event) {
+    case 'overview':
+      state.containers = event.containers || [];
+      state.tree = event.tree || [];
+      state.approvals = event.approvals || [];
+      state.messages = event.operator_inbox || [];
+      renderTree();
+      renderComposeTargets();
+      renderApprovals();
+      renderMessages();
+      if (!state.selected && state.containers.length) select(state.containers[0].name);
+      break;
+
+    case 'approval.requested':
+      state.approvals.push(event);
+      renderApprovals();
+      break;
+
+    case 'approval.resolved':
+      state.approvals = state.approvals.filter((a) => a.id !== event.id);
+      renderApprovals();
+      break;
+
+    case 'message':
+      if (event.to === 'operator') {
+        state.messages.push(event.message);
+        renderMessages();
+      }
+      break;
+
+    case 'container.registered':
+    case 'container.started':
+    case 'container.exited':
+    case 'container.destroyed':
+      refreshOverview();
+      break;
+  }
+}
+
+async function refreshOverview() {
+  const data = await api('/api/overview');
+  state.containers = data.containers;
+  state.tree = data.tree;
+  state.approvals = data.approvals;
+  renderTree();
+  renderComposeTargets();
+  renderApprovals();
+  if (state.selected) loadCaps(state.selected);
+}
+
+// ------------------------------------------------------------------ wiring
+
+function wire() {
+  document.querySelectorAll('.tabs button').forEach((b) =>
+    b.addEventListener('click', () => showTab(b.dataset.tab)));
+
+  $('audit-refresh').addEventListener('click', renderAudit);
+  $('audit-denied').addEventListener('change', renderAudit);
+
+  $('compose').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const target = $('compose-target').value;
+    const message = $('compose-body').value.trim();
+    if (!target || !message) return;
+    try {
+      await api('/api/send', {
+        method: 'POST',
+        body: JSON.stringify({ target, message }),
+      });
+      $('compose-body').value = '';
+    } catch (err) {
+      alert(`Send failed: ${err.message}`);
+    }
+  });
+
+  const action = async (path, method = 'POST') => {
+    if (!state.selected) return;
+    try {
+      await api(`/api/containers/${state.selected}${path}`, { method });
+      await refreshOverview();
+      if (path === '/start') setTimeout(() => openTerminal(state.selected), 300);
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  $('btn-start').addEventListener('click', () => action('/start'));
+  $('btn-stop').addEventListener('click', () => action('/stop'));
+  $('btn-interrupt').addEventListener('click', () => action('/signal?sig=2'));
+
+  wireGrant();
+}
+
+initTheme();
+initTerminal();
+wire();
+connect();

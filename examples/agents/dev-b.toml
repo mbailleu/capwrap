@@ -1,0 +1,63 @@
+# Agent B: the same repo and the same database as agent A, but its own branch
+# and its own overlay. Run both at once and watch them not collide.
+#
+#   capwrap run examples/agents/dev-b.toml
+
+name = "dev-b"
+
+[runtime]
+command = ["/bin/bash", "-l"]
+cwd     = "/work"
+tty     = true
+notify  = "file"
+
+[sandbox]
+base     = "host-ro"
+network  = false
+hostname = "dev-b"
+unshare  = ["pid", "ipc", "uts", "cgroup"]
+
+[[mounts]]
+src        = "~/capwrap-demo/repo"
+dest       = "/work"
+mode       = "worktree"
+share      = "objects"
+branch     = "capwrap/dev-b"
+base       = "main"
+on_destroy = "keep"
+
+[[mounts]]
+src  = "~/capwrap-demo/db"
+dest = "/db"
+mode = "overlay"
+
+[[mounts]]
+src  = "~/capwrap-demo/ref"
+dest = "/ref"
+mode = "ro"
+
+[[mounts]]
+dest = "/scratch"
+mode = "tmpfs"
+size = "128m"
+
+[[files]]
+dest    = "/work/ROLE.md"
+content = """
+# You are agent B
+
+Your branch is `capwrap/dev-b`. Everything else works as it does for agent A.
+"""
+
+[caps]
+parent = ["send"]
+
+# B may talk to A, and may additionally interrupt it -- an asymmetry, to show
+# that rights are per-edge rather than a global "peers can do X" setting.
+peers = [{ container = "dev-a", rights = ["send", "inspect", "signal"] }]
+
+# B may create up to two children of its own. Those children start with no
+# authority at all beyond what B delegates to them.
+[caps.factory]
+rights = ["create"]
+quota  = { containers = 2 }

@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>capwrap</title>
+  <link rel="stylesheet" href="/static/vendor/xterm.css">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">▣</span>
+      <strong>capwrap</strong>
+      <span class="muted">capability-governed agent containers</span>
+    </div>
+    <div class="topbar-right">
+      <span id="conn" class="pill pill-warn">connecting…</span>
+      <button id="theme-toggle" class="ghost" title="Toggle theme">◐</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- ---------------------------------------------------------- -->
+    <aside class="sidebar">
+      <h2>Containers</h2>
+      <div id="tree" class="tree"></div>
+
+      <h2>Send a message</h2>
+      <form id="compose" class="compose">
+        <select id="compose-target" required></select>
+        <textarea id="compose-body" rows="3"
+                  placeholder="Message, delivered to the agent's mailbox…"></textarea>
+        <button type="submit">Send as operator</button>
+      </form>
+    </aside>
+
+    <!-- ---------------------------------------------------------- -->
+    <section class="content">
+      <nav class="tabs">
+        <button data-tab="terminal" class="active">Terminal</button>
+        <button data-tab="grid">All agents</button>
+        <button data-tab="caps">Capabilities</button>
+        <button data-tab="audit">Audit</button>
+      </nav>
+
+      <div id="tab-terminal" class="tab-panel active">
+        <div class="panel-head">
+          <span id="term-title" class="mono">no container selected</span>
+          <span class="spacer"></span>
+          <button id="btn-start" class="ghost">Start</button>
+          <button id="btn-interrupt" class="ghost">Interrupt</button>
+          <button id="btn-stop" class="ghost danger">Stop</button>
+        </div>
+        <div id="terminal" class="terminal-host"></div>
+      </div>
+
+      <div id="tab-grid" class="tab-panel">
+        <p class="muted pad">
+          Every agent at once. Click a tile to open it full size.
+        </p>
+        <div id="grid" class="grid"></div>
+      </div>
+
+      <div id="tab-caps" class="tab-panel">
+        <div class="panel-head">
+          <span id="caps-title" class="mono">capabilities</span>
+          <span class="spacer"></span>
+          <button id="btn-grant" class="ghost">Grant a capability…</button>
+        </div>
+
+        <form id="grant-form" class="grant" hidden>
+          <p class="muted small">
+            Hand this container authority over another one, right now. The
+            operator holds a root capability on everything, so this is an
+            ordinary delegation — and it is audited like any other.
+          </p>
+          <div class="grant-row">
+            <label>Give <strong id="grant-holder" class="mono">?</strong>
+              a capability on</label>
+            <select id="grant-target" required></select>
+          </div>
+          <div class="grant-row">
+            <label>with rights</label>
+            <div id="grant-rights" class="rights-picker"></div>
+          </div>
+          <div class="grant-row">
+            <button type="submit" class="primary">Grant</button>
+            <button type="button" id="grant-cancel" class="ghost">Cancel</button>
+          </div>
+        </form>
+
+        <div id="caps" class="caps"></div>
+      </div>
+
+      <div id="tab-audit" class="tab-panel">
+        <div class="panel-head">
+          <label class="check">
+            <input type="checkbox" id="audit-denied"> denials only
+          </label>
+          <span class="spacer"></span>
+          <button id="audit-refresh" class="ghost">Refresh</button>
+        </div>
+        <div id="audit" class="audit"></div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------- -->
+    <aside class="inbox">
+      <h2>
+        Approvals
+        <span id="approval-count" class="pill pill-quiet">0</span>
+      </h2>
+      <p class="muted small">
+        Every agent's permission requests land here, so you never have to go
+        looking through terminals for a blocked prompt.
+      </p>
+      <div id="approvals" class="approvals"></div>
+
+      <h2>Operator inbox</h2>
+      <div id="messages" class="messages"></div>
+    </aside>
+  </main>
+
+  <script src="/static/vendor/xterm.js"></script>
+  <script src="/static/vendor/addon-fit.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

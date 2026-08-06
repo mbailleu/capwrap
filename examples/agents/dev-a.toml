@@ -1,0 +1,69 @@
+# Agent A: works on the demo repo on its own git branch, and shares the demo
+# "database" with agent B through an overlay so neither can disturb the other.
+#
+#   capwrap run examples/agents/dev-a.toml
+
+name = "dev-a"
+
+[runtime]
+command = ["/bin/bash", "-l"]
+cwd     = "/work"
+tty     = true
+notify  = "file"
+
+[sandbox]
+base     = "host-ro"
+network  = false
+hostname = "dev-a"
+unshare  = ["pid", "ipc", "uts", "cgroup"]
+
+# The source repo: a private branch + checkout. Integrate later with
+# `git merge capwrap/dev-a` from the host repo.
+[[mounts]]
+src        = "~/capwrap-demo/repo"
+dest       = "/work"
+mode       = "worktree"
+share      = "objects"
+branch     = "capwrap/dev-a"
+base       = "main"
+on_destroy = "keep"
+
+# Shared mutable state: both agents see the same starting contents, and each
+# one's writes stay private. This is the no-coordination trick.
+[[mounts]]
+src  = "~/capwrap-demo/db"
+dest = "/db"
+mode = "overlay"
+
+# Reference material nobody may modify.
+[[mounts]]
+src  = "~/capwrap-demo/ref"
+dest = "/ref"
+mode = "ro"
+
+# Scratch space that evaporates with the container.
+[[mounts]]
+dest = "/scratch"
+mode = "tmpfs"
+size = "128m"
+
+[[files]]
+dest    = "/work/ROLE.md"
+content = """
+# You are agent A
+
+Your branch is `capwrap/dev-a`. Work only in /work.
+/db is yours to write to; your writes are invisible to other agents.
+/ref is read-only.
+
+Talk to other agents with `capctl send <slot> "<message>"`; see `capctl caps`.
+"""
+
+[caps]
+parent = ["send"]
+
+# Agent A may message agent B, and see that it exists -- but not kill it.
+peers = [{ container = "dev-b", rights = ["send", "inspect"] }]
+
+# A dataspace it may read and hand on to others, but not write.
+dataspaces = [{ path = "~/capwrap-demo/ref", rights = ["read", "map", "delegate"] }]

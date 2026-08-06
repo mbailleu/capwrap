@@ -1,0 +1,57 @@
+# A deliberately small, deterministic test that a real Claude agent's permission
+# prompt reaches the web console and that your answer controls what it does.
+#
+#   examples/setup-demo.sh
+#   capwrap up examples/agents/claude-approval-demo.toml
+#   # open http://127.0.0.1:8420 -- an approval appears within a few seconds
+#
+# Claude is asked to create a file. Read/Glob/Grep are auto-allowed, so the only
+# thing that reaches you is the Write. Approve it and the file appears on the
+# agent's branch; deny it and Claude tells you it was blocked.
+
+name = "claude-approve"
+
+[runtime]
+command = ["/opt/claude/claude", "-p",
+           "Create a file called hello.txt in the current directory containing exactly the word 'hello'. Then say DONE."]
+cwd     = "/work"
+tty     = true
+
+approvals = "capwrap"
+
+# Everything read-only is decided locally; only the write needs a human.
+auto_allow = ["Read", "Glob", "Grep", "TodoWrite"]
+auto_deny  = ["Bash(sudo *)"]
+
+[sandbox]
+network  = true          # Claude needs to reach the API
+hostname = "claude-approve"
+unshare  = ["pid", "ipc", "uts", "cgroup"]
+
+[[mounts]]
+src  = "~/.local/bin/claude"
+dest = "/opt/claude/claude"
+mode = "ro"
+
+# Private copies: Claude refreshes its OAuth token, and each container should
+# own that rather than racing the host over one file.
+[[mounts]]
+src  = "~/.claude"
+dest = "/home/agent/.claude"
+mode = "copy"
+
+[[mounts]]
+src  = "~/.claude.json"
+dest = "/home/agent/.claude.json"
+mode = "copy"
+
+[[mounts]]
+src        = "~/capwrap-demo/repo"
+dest       = "/work"
+mode       = "worktree"
+branch     = "capwrap/claude-approve"
+base       = "main"
+on_destroy = "keep"
+
+[caps]
+parent = ["send"]
