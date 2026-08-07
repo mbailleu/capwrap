@@ -433,6 +433,66 @@ def test_pruning_does_not_disturb_a_sibling_worktree(tmp_path, state_dir, git_re
     assert str(alive.worktree("/work")) in listing
 
 
+def test_an_orphaned_worktree_is_moved_aside_and_recreated(
+    tmp_path, state_dir, git_repo
+):
+    """A container's state outlives its source repo.
+
+    Re-clone or recreate the repo and the checkout is still sitting there with a
+    `.git` file pointing at an admin directory that no longer exists. Reusing it
+    gives the agent `fatal: not a git repository` with nothing explaining why.
+    """
+    import subprocess as sp
+
+    config = make({
+        "name": "wt",
+        "mounts": [{"src": str(git_repo), "dest": "/work",
+                    "mode": "worktree", "base": "main"}],
+    }, tmp_path)
+    paths = ContainerPaths("wt")
+    fsprep.prepare(config, paths)
+    worktree = paths.worktree("/work")
+    (worktree / "uncommitted.txt").write_text("work in progress\n")
+
+    # Recreate the repo from scratch, exactly as a re-clone would.
+    from capwrap.paths import force_rmtree
+    force_rmtree(git_repo)
+    git_repo.mkdir()
+    for args in (["init", "--quiet", "--initial-branch=main"],
+                 ["config", "user.email", "t@x"], ["config", "user.name", "T"]):
+        sp.run(["git", *args], cwd=git_repo, check=True, capture_output=True)
+    (git_repo / "README.md").write_text("fresh\n")
+    sp.run(["git", "add", "-A"], cwd=git_repo, check=True, capture_output=True)
+    sp.run(["git", "commit", "--quiet", "-m", "new"], cwd=git_repo, check=True,
+           capture_output=True)
+
+    fsprep.prepare(config, paths)
+
+    # The stale checkout is kept, because it holds the agent's uncommitted work.
+    orphans = list(worktree.parent.glob("work.orphaned-*"))
+    assert len(orphans) == 1
+    assert (orphans[0] / "uncommitted.txt").read_text() == "work in progress\n"
+
+    # And the fresh one is a working worktree of the new repo.
+    assert gitwt.current_branch(worktree) == "capwrap/wt"
+    status = sp.run(["git", "status", "--short"], cwd=worktree,
+                    capture_output=True, text=True)
+    assert status.returncode == 0, status.stderr
+
+
+def test_a_healthy_worktree_is_never_quarantined(tmp_path, state_dir, git_repo):
+    config = make({
+        "name": "wt",
+        "mounts": [{"src": str(git_repo), "dest": "/work",
+                    "mode": "worktree", "base": "main"}],
+    }, tmp_path)
+    paths = ContainerPaths("wt")
+    fsprep.prepare(config, paths)
+    fsprep.prepare(config, paths)
+    fsprep.prepare(config, paths)
+    assert not list(paths.worktree("/work").parent.glob("*.orphaned-*"))
+
+
 def test_worktree_is_reused_across_restarts(tmp_path, state_dir, git_repo):
     config = make({
         "name": "wt",

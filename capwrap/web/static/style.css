@@ -372,3 +372,21 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 }
 .rights-picker { display: flex; flex-wrap: wrap; gap: 10px; }
 .rights-picker .check { gap: 4px; cursor: pointer; }
+
+/* Dismiss control on a finished container: present but quiet until you go
+   looking for it, so the tree stays readable. */
+.node .dismiss {
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 2px;
+  margin-left: 6px;
+  opacity: 0;
+  cursor: pointer;
+}
+.node:hover .dismiss,
+.node .dismiss:focus-visible { opacity: 1; }
+.node .dismiss:hover { color: var(--danger); }
+h2 #dismiss-finished { margin-left: auto; text-transform: none; letter-spacing: 0; }

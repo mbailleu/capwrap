@@ -217,11 +217,21 @@ class Daemon:
         code = await container.session.terminate(grace=grace)
         return code
 
-    async def destroy(self, name: str, remove_state: bool = False) -> None:
-        """Stop a container and revoke everything it held or passed on."""
+    async def destroy(
+        self, name: str, remove_state: bool = False, force: bool = False
+    ) -> dict:
+        """Dismiss a container: stop it, revoke its authority, forget it.
+
+        A running container is refused unless `force`, so a mis-click in the tree
+        cannot kill an agent that is in the middle of something.
+        """
         container = self.containers.get(name)
         if container is None:
-            return
+            raise CapwrapError(f"no such container: {name}")
+        if container.running and not force:
+            raise CapwrapError(
+                f"{name} is still running; stop it first, or dismiss with force"
+            )
         await self.stop(name)
 
         if container.server is not None:
@@ -231,13 +241,20 @@ class Daemon:
         if container.prepared is not None:
             container.prepared.cleanup()
 
-        self.kernel.destroy_container(name)
+        result = self.kernel.forget_container(name)
         self.mailboxes.drop(name)
         del self.containers[name]
 
         if remove_state:
             force_rmtree(container.paths.root)
         self._emit("container.destroyed", {"container": name})
+        return {**result, "state_removed": remove_state}
+
+    def dismissable(self) -> list[str]:
+        """Containers that have finished and could be cleared away."""
+        return sorted(
+            name for name, c in self.containers.items() if not c.running
+        )
 
     def _get(self, name: str) -> Container:
         container = self.containers.get(name)

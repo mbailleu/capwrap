@@ -381,7 +381,12 @@ class CapKernel:
             )
 
     def destroy_container(self, name: str) -> None:
-        """Drop a container's task and revoke everything it held or passed on."""
+        """Drop a container's task and revoke everything it held or passed on.
+
+        The object itself survives, marked dead, so a stopped container is still
+        visible and its exit code still readable.  `forget_container` is what
+        removes it for good.
+        """
         killed = self.mapdb.revoke_holder(name)
         self._apply_revocations(killed)
         self.tasks.pop(name, None)
@@ -392,6 +397,51 @@ class CapKernel:
             ROOT, "container.destroy", allowed=True, target=name,
             detail={"mappings_revoked": len(killed)},
         )
+
+    def forget_container(self, name: str) -> dict:
+        """Remove a container from the system entirely -- the operator's dismiss.
+
+        A stopped container is deliberately kept: you usually want to read its
+        exit code and see where it sat in the tree.  Once you don't, this drops
+        it, and three things have to happen together or the model breaks:
+
+        1. Everything it held is revoked, recursively, as on destroy.
+        2. Every capability *others* hold **on it** is revoked too. Otherwise a
+           peer keeps a slot pointing at an object that no longer exists --
+           `cap.list` would quietly skip it while the slot stayed occupied, and
+           invoking it would fail as an internal error rather than a clean denial.
+        3. Its children are reparented to its own parent. The tree is built by
+           walking down from the roots, so a child whose parent has vanished is
+           unreachable: it would silently disappear from the UI while still
+           running.
+        """
+        obj = self.find_container(name)
+        if obj is None:
+            raise NoSuchCapability(f"no such container: {name}")
+        if obj.state == "running":
+            raise CapabilityError(
+                f"{name} is still running; stop it before dismissing it"
+            )
+
+        killed = self.mapdb.revoke_holder(name)
+        killed += self.mapdb.revoke_object(obj.oid)
+        self._apply_revocations(killed)
+
+        adopted = []
+        for other in self.objects.values():
+            if isinstance(other, ContainerObject) and other.parent == name:
+                other.parent = obj.parent
+                adopted.append(other.name)
+
+        self.tasks.pop(name, None)
+        self.objects.pop(obj.oid, None)
+
+        self.audit.record(
+            ROOT, "container.forget", allowed=True, target=name,
+            detail={"mappings_revoked": len(killed), "reparented": adopted},
+        )
+        return {"forgotten": name, "mappings_revoked": len(killed),
+                "reparented": adopted}
 
     # ==================================================================
     # the syscall surface -- everything below is reachable by an agent

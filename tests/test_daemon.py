@@ -15,6 +15,7 @@ import pytest
 
 from capwrap.config import load_config_data
 from capwrap.daemon import Daemon
+from capwrap.errors import CapwrapError
 from capwrap.ipc.protocol import Request, Response
 
 
@@ -873,3 +874,134 @@ async def test_an_unknown_request_kind_is_refused(daemon, tmp_path):
                           {"kind": "root", "target": "everything"})
     assert not reply.ok
     assert not daemon.pending_approvals(), "a bad kind must not reach the operator"
+
+
+# ==========================================================================
+# dismissing a finished container
+# ==========================================================================
+
+
+def tree_names(daemon) -> set[str]:
+    """Every container the operator's tree actually shows, at any depth."""
+    found: set[str] = set()
+
+    def walk(nodes):
+        for node in nodes:
+            found.add(node["name"])
+            walk(node.get("children", []))
+
+    walk(daemon.kernel.container_tree())
+    return found
+
+
+async def test_a_stopped_container_stays_until_dismissed(daemon, tmp_path):
+    """Keeping it is deliberate -- you usually want its exit code first."""
+    daemon.register(config("gone", tmp_path))
+    daemon.kernel.find_container("gone").state = "exited"
+
+    assert "gone" in tree_names(daemon)
+
+    await daemon.destroy("gone")
+    assert "gone" not in tree_names(daemon), "dismissing must clear the tree entry"
+    assert "gone" not in daemon.containers
+
+
+async def test_a_running_container_is_not_dismissed_by_accident(daemon, tmp_path):
+    daemon.register(config("busy", tmp_path))
+    container = daemon.containers["busy"]
+
+    class Fake:
+        running = True
+
+        async def terminate(self, grace=5.0):
+            return 0
+
+    container.session = Fake()
+    with pytest.raises(CapwrapError, match="still running"):
+        await daemon.destroy("busy")
+    assert "busy" in daemon.containers
+
+    container.session = None  # stopped; now it goes
+    await daemon.destroy("busy")
+    assert "busy" not in daemon.containers
+
+
+async def test_dismissing_revokes_capabilities_others_held_on_it(daemon, tmp_path):
+    """Otherwise a peer keeps a slot pointing at an object that no longer exists.
+
+    `cap.list` would quietly skip it while the slot stayed occupied, and using it
+    would surface as an internal error rather than a clean denial.
+    """
+    peers = {"caps": {"peers": [{"container": "doomed", "rights": ["send"]}]}}
+    daemon.register(config("watcher", tmp_path, **peers))
+    daemon.register(config("doomed", tmp_path))
+    daemon.link_all_peers()
+    daemon.kernel.find_container("doomed").state = "exited"
+
+    held = [c for c in daemon.kernel.cap_list("watcher") if c.label == "peer:doomed"]
+    assert held, "precondition: watcher holds a capability on doomed"
+    slot = held[0].slot
+
+    await daemon.destroy("doomed")
+
+    assert slot not in daemon.kernel.tasks["watcher"].slots
+    assert not any(
+        c.label == "peer:doomed" for c in daemon.kernel.cap_list("watcher")
+    )
+
+
+async def test_dismissing_a_parent_does_not_hide_its_children(daemon, tmp_path):
+    """The tree is walked down from the roots.
+
+    A child whose parent has been removed would be unreachable -- it would
+    vanish from the UI while still being a real container.
+    """
+    daemon.register(config(
+        "boss", tmp_path,
+        caps={"factory": {"rights": ["create"], "quota": {"containers": 2}}},
+    ))
+    daemon.register(config("worker", tmp_path), parent="boss")
+    assert {"boss", "worker"} <= tree_names(daemon)
+
+    daemon.kernel.find_container("boss").state = "exited"
+    result = await daemon.destroy("boss")
+
+    assert result["reparented"] == ["worker"]
+    assert "worker" in tree_names(daemon), "the child disappeared from the tree"
+    assert daemon.kernel.find_container("worker").parent is None
+
+
+async def test_dismissing_keeps_host_state_by_default(daemon, tmp_path, state_dir):
+    daemon.register(config("keeper", tmp_path))
+    container = daemon.containers["keeper"]
+    container.paths.ensure()
+    (container.paths.root / "evidence.txt").write_text("the agent's work\n")
+    daemon.kernel.find_container("keeper").state = "exited"
+
+    await daemon.destroy("keeper")
+    assert (container.paths.root / "evidence.txt").exists(), \
+        "dismissing must not throw away the work the container produced"
+
+
+async def test_dismissing_can_also_remove_state_when_asked(daemon, tmp_path, state_dir):
+    daemon.register(config("tidy", tmp_path))
+    container = daemon.containers["tidy"]
+    container.paths.ensure()
+    daemon.kernel.find_container("tidy").state = "exited"
+
+    await daemon.destroy("tidy", remove_state=True)
+    assert not container.paths.root.exists()
+
+
+async def test_dismissing_frees_the_name_for_reuse(daemon, tmp_path):
+    daemon.register(config("recycled", tmp_path))
+    daemon.kernel.find_container("recycled").state = "exited"
+    await daemon.destroy("recycled")
+
+    daemon.register(config("recycled", tmp_path))  # must not clash
+    assert "recycled" in daemon.containers
+
+
+async def test_dismissing_an_unknown_container_is_an_error(daemon, tmp_path):
+    with pytest.raises(CapwrapError, match="no such container"):
+        await daemon.destroy("never-existed")

@@ -171,12 +171,20 @@ function renderTree() {
     const status = statusOf(live);
     const selected = state.selected === entry.name ? ' selected' : '';
     const kids = (entry.children || []).map(node).join('');
+    // Only a finished container offers dismiss, so a mis-click cannot end an
+    // agent that is mid-task. Stop it first if you mean to.
+    const dismiss = status === 'running' ? '' : `
+      <button class="dismiss" data-dismiss="${escapeHtml(entry.name)}"
+              title="Dismiss ${escapeHtml(entry.name)}">×</button>`;
+    const exit = live.exit_code !== null && live.exit_code !== undefined
+      ? `exit ${live.exit_code}` : `${entry.caps ?? 0} caps`;
     return `
       <div>
         <div class="node${selected}" data-name="${escapeHtml(entry.name)}">
           <span class="dot ${status}"></span>
           <span class="name">${escapeHtml(entry.name)}</span>
-          <span class="meta">${entry.caps ?? 0} caps</span>
+          <span class="meta">${escapeHtml(exit)}</span>
+          ${dismiss}
         </div>
         ${kids ? `<div class="children">${kids}</div>` : ''}
       </div>`;
@@ -186,6 +194,44 @@ function renderTree() {
   host.querySelectorAll('.node').forEach((el) => {
     el.addEventListener('click', () => select(el.dataset.name));
   });
+  host.querySelectorAll('[data-dismiss]').forEach((b) => {
+    b.addEventListener('click', (event) => {
+      event.stopPropagation();   // do not also select the node we are removing
+      dismissContainer(b.dataset.dismiss);
+    });
+  });
+
+  const finished = state.containers.filter((c) => !c.running).length;
+  $('dismiss-finished').hidden = finished === 0;
+  $('dismiss-finished').textContent = `Dismiss ${finished} finished`;
+}
+
+async function dismissContainer(name) {
+  const ok = confirm(
+    `Dismiss ${name}?\n\n`
+    + 'It is removed from the tree and its capabilities are revoked, including '
+    + 'any that other agents hold on it.\n\n'
+    + 'Its work on disk is kept — the git branch, overlay writes and private '
+    + `copies all survive. Run \`capwrap clean ${name} --yes\` to delete those too.`,
+  );
+  if (!ok) return;
+  try {
+    const result = await api(`/api/containers/${name}`, { method: 'DELETE' });
+    if (result.reparented && result.reparented.length) {
+      alert(`${name} dismissed. Its children now sit under its parent: `
+            + result.reparented.join(', '));
+    }
+    if (state.selected === name) {
+      state.selected = null;
+      if (termSocket) { termSocket.close(); termSocket = null; }
+      term.reset();
+      $('term-title').textContent = 'no container selected';
+      renderCaps();
+    }
+    await refreshOverview();
+  } catch (err) {
+    alert(`Could not dismiss ${name}: ${err.message}`);
+  }
 }
 
 function renderComposeTargets() {
@@ -774,6 +820,20 @@ function wire() {
   $('btn-start').addEventListener('click', () => action('/start'));
   $('btn-stop').addEventListener('click', () => action('/stop'));
   $('btn-interrupt').addEventListener('click', () => action('/signal?sig=2'));
+
+  $('dismiss-finished').addEventListener('click', async () => {
+    const names = state.containers.filter((c) => !c.running).map((c) => c.name);
+    if (!names.length) return;
+    if (!confirm(`Dismiss ${names.length} finished container(s)?\n\n`
+                 + names.join(', ') + '\n\nWork on disk is kept.')) return;
+    try {
+      await api('/api/containers/dismiss-finished', { method: 'POST' });
+      if (names.includes(state.selected)) state.selected = null;
+      await refreshOverview();
+    } catch (err) {
+      alert(err.message);
+    }
+  });
 
   wireGrant();
 }

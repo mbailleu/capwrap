@@ -395,12 +395,41 @@ config that leaves it out is rejected rather than silently leaking processes.
 `--die-with-parent` extends the same property to a daemon crash — `kill -9` on
 the daemon tears the namespace down too. Both cases are covered by tests.
 
-To also remove a container's host-side state (overlay upper dirs, copies,
-worktree):
+## Dismissing a finished container
+
+A stopped container stays in the tree on purpose — you usually want to read its
+exit code and see where it sat. When you don't, hover it in the container list
+and click **×**, or use **Dismiss N finished** to clear them all at once.
+
+Dismissing does three things that have to happen together:
+
+- revokes everything it held, recursively;
+- revokes every capability **others hold on it** — otherwise a peer keeps a slot
+  pointing at an object that no longer exists, which `capctl` would quietly skip
+  while the slot stayed occupied;
+- reparents its children to its own parent — the tree is walked down from the
+  roots, so a child whose parent vanished would disappear from the UI while
+  still running.
+
+A **running** container is refused; stop it first. Its work on disk is kept —
+the git branch, overlay writes and private copies all survive. To delete those
+too:
 
 ```bash
 capwrap clean <name> --yes
 ```
+
+## If the source repo is recreated
+
+A container's state outlives its repo. Re-clone or recreate the repo and the
+checkout under the container's state directory still points at an admin
+directory that no longer exists — the agent then meets
+`fatal: not a git repository` with nothing explaining why.
+
+capwrap detects that at startup, renames the stale checkout to
+`work.orphaned-<timestamp>` and cuts a fresh worktree, printing what it did. It
+renames rather than deletes, because the old checkout may hold work the agent
+never committed.
 
 ---
 
@@ -464,7 +493,7 @@ capwrap/
   ipc/             protocol · per-container socket server · mailboxes
   guest/           capctl, hook.py — the only things an agent sees
   web/             FastAPI + a vanilla-JS console, xterm.js vendored locally
-tests/            137 tests; `-m sandbox` ones need a working bwrap
+tests/            147 tests; `-m sandbox` ones need a working bwrap
 ```
 
 The split that matters: `kernel/` decides what is permitted and performs no I/O;

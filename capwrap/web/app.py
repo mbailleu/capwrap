@@ -180,9 +180,27 @@ def create_app(daemon: Daemon) -> FastAPI:
         return {"container": name, "signal": sig}
 
     @app.delete("/api/containers/{name}")
-    async def destroy(name: str, remove_state: bool = False) -> dict:
-        await daemon.destroy(name, remove_state=remove_state)
-        return {"destroyed": name}
+    async def destroy(
+        name: str, remove_state: bool = False, force: bool = False
+    ) -> dict:
+        """Dismiss a container: forget it entirely, tree entry included.
+
+        `remove_state=true` also deletes its host-side directory -- overlay
+        writes, private copies, and the git worktree with whatever the agent
+        committed. Off by default, because that work usually outlives the
+        container that produced it.
+        """
+        return await daemon.destroy(name, remove_state=remove_state, force=force)
+
+    @app.post("/api/containers/dismiss-finished")
+    async def dismiss_finished(remove_state: bool = False) -> dict:
+        """Clear away every container that has already exited."""
+        dismissed = []
+        for name in daemon.dismissable():
+            with contextlib.suppress(CapwrapError):
+                await daemon.destroy(name, remove_state=remove_state)
+                dismissed.append(name)
+        return {"dismissed": dismissed}
 
     @app.post("/api/containers/{name}/input")
     async def write_input(name: str, body: InputBody) -> dict:

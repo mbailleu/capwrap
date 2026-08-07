@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,6 +64,9 @@ class WorktreeResult:
     #: Where `main_gitdir` must appear inside the sandbox.
     guest_gitdir: str | None
     branch: str | None
+    #: Set when a stale checkout was renamed out of the way, so the caller can
+    #: say so rather than leaving it to be discovered later.
+    quarantined: Path | None = None
 
 
 def _git(*args: str, cwd: Path | None = None) -> str:
@@ -191,6 +195,8 @@ def _prepare_linked_worktree(
     gitdir = main_git_dir(src)
     guest_gitdir = f"{guest_gitdir_root.rstrip('/')}/{slug}"
 
+    quarantined = _quarantine_if_orphaned(target, gitdir)
+
     if not (target / ".git").exists():
         target.parent.mkdir(parents=True, exist_ok=True)
         # Clear stale registrations before adding. `capwrap clean` (and anything
@@ -242,7 +248,48 @@ def _prepare_linked_worktree(
         dotgit_file=staged,
         guest_gitdir=guest_gitdir,
         branch=branch,
+        quarantined=quarantined,
     )
+
+
+def _quarantine_if_orphaned(target: Path, gitdir: Path) -> Path | None:
+    """Move a worktree aside if the repo no longer knows about it.
+
+    A container's state outlives its source repo.  Re-clone the repo, or delete
+    and recreate it, and the checkout under the container's state directory is
+    still there with a ``.git`` file pointing at an admin directory that no
+    longer exists.  `prepare` would happily reuse it, because `.git` exists --
+    and the agent would then meet:
+
+        fatal: not a git repository: /gitdir/work/worktrees/work
+
+    with nothing anywhere explaining why.  So detect the orphan and rename it out
+    of the way, leaving a fresh worktree to be created in its place.
+
+    Renamed rather than deleted: it may hold work the agent had not committed,
+    and that is not ours to throw away.  Returns the new path so the caller can
+    tell someone.
+    """
+    dotgit = target / ".git"
+    if not dotgit.is_file():
+        return None  # absent, or a full clone with a real .git directory
+
+    try:
+        admin = Path(dotgit.read_text().split(":", 1)[1].strip())
+    except (OSError, IndexError):
+        admin = None
+
+    if admin is not None and admin.is_dir():
+        try:
+            admin.relative_to(gitdir)
+            return None  # still attached to this repo
+        except ValueError:
+            pass  # points into a different repo
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    aside = target.with_name(f"{target.name}.orphaned-{stamp}")
+    target.rename(aside)
+    return aside
 
 
 def remove_worktree(src: Path, target: Path) -> None:

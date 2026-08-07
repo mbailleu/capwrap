@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -303,6 +304,15 @@ def _prep_worktree(mount, config, paths, prepared, backend) -> None:
         base=mount.base,
         detach=mount.detach,
     )
+
+    if result.quarantined is not None:
+        # Loud, because the agent's previous uncommitted work is in there.
+        print(
+            f"capwrap: {config.name}: the checkout at {mount.dest} no longer "
+            f"belongs to {mount.src} (was the repo recreated?). Moved it to "
+            f"{result.quarantined} and cut a fresh worktree.",
+            file=sys.stderr,
+        )
 
     origin = f"git worktree {result.branch or 'detached'} of {mount.src}"
     prepared.mounts.append(
