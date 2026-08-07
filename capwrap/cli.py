@@ -71,12 +71,19 @@ def cmd_run(args: argparse.Namespace) -> int:
         guest_tools=_guest_tools_dir(),
     )
 
+    env = bwrap_mod.build_env(config)
+
     if args.dry_run:
         print(f"# container: {config.name}")
         print(f"# state:     {paths.root}")
         print(f"# overlay:   {backend}")
         for line in fsprep.describe(prepared):
             print(f"# mount:     {line}")
+        print("#")
+        # Values of secret-looking names are masked: the point of passing the
+        # environment this way is that tokens do not end up somewhere readable.
+        for key, value in sorted(bwrap_mod.redact(env).items()):
+            print(f"# env:       {key}={value}")
         print()
         print(bwrap_mod.render(argv))
         prepared.cleanup()
@@ -86,7 +93,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"capwrap: {config.name} -> {' '.join(config.runtime.command)}", file=sys.stderr)
 
     try:
-        os.execv(argv[0], argv)
+        # execve, not execv: the container's environment is inherited rather
+        # than passed as --setenv, so it never appears in argv.
+        os.execve(argv[0], argv, env)
     except OSError as exc:
         prepared.cleanup()
         raise CapwrapError(f"failed to exec {argv[0]}: {exc}") from None

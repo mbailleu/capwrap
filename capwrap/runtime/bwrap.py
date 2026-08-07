@@ -49,7 +49,11 @@ def build_argv(
     guest_tools: Path | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> list[str]:
-    """Full argv, from the bwrap binary through to the agent's command."""
+    """Full argv, from the bwrap binary through to the agent's command.
+
+    The environment is *not* part of this; use `build_env` and pass the result as
+    the process environment.
+    """
     argv: list[str] = [bwrap]
     argv += _namespace_args(config)
     argv += _base_args(config)
@@ -60,8 +64,9 @@ def build_argv(
     argv += _mount_args(prepared.mounts)
     # Injected files come last and therefore win over every mount.
     argv += _file_args(prepared.files)
-    argv += _env_args(config, extra_env or {})
-
+    # Note: no --setenv here. The environment is handed to bwrap as its own, and
+    # inherited by the child, so secrets stay out of the world-readable argv.
+    # See `build_env`.
     argv += ["--chdir", config.runtime.cwd]
     argv += ["--"]
     argv += list(config.runtime.command)
@@ -221,12 +226,38 @@ def _file_args(files: list[tuple[Path, str]]) -> list[str]:
     return args
 
 
-def _env_args(config: ContainerConfig, extra: dict[str, str]) -> list[str]:
-    args: list[str] = []
-    if config.sandbox.clear_env:
-        args.append("--clearenv")
+#: Environment variable names whose values must never be printed.  Matched as a
+#: substring, so ANTHROPIC_AUTH_TOKEN and MY_API_KEY are both covered.
+SECRET_HINTS = ("TOKEN", "KEY", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
 
-    env: dict[str, str] = {
+
+def is_secret(name: str) -> bool:
+    return any(hint in name.upper() for hint in SECRET_HINTS)
+
+
+def redact(env: dict[str, str]) -> dict[str, str]:
+    """Env with secret values masked, for `--dry-run` and the web UI."""
+    return {
+        k: ("<redacted>" if is_secret(k) and v else v) for k, v in env.items()
+    }
+
+
+def build_env(config: ContainerConfig, extra: dict[str, str] | None = None) -> dict[str, str]:
+    """The complete environment the container's process will see.
+
+    Handed to bwrap as *its own* environment and inherited by the child, rather
+    than passed as `--setenv` pairs. That is a security requirement, not a
+    style choice: argv is world-readable through /proc/<pid>/cmdline, so
+    `--setenv ANTHROPIC_AUTH_TOKEN sk-ant-...` publishes the token to every
+    user on the host. An inherited environment is readable only by the process
+    owner (/proc/<pid>/environ is 0400).
+    """
+    env: dict[str, str] = {}
+    if not config.sandbox.clear_env:
+        # Opt-in inheritance of the daemon's whole environment.
+        env.update(os.environ)
+
+    env.update({
         "HOME": GUEST_HOME,
         "USER": "agent",
         "LOGNAME": "agent",
@@ -242,16 +273,48 @@ def _env_args(config: ContainerConfig, extra: dict[str, str]) -> list[str]:
         "CAPWRAP_SHARED": GUEST_SHARED,
         "CAPWRAP_POLICY": GUEST_POLICY,
         "GIT_CONFIG_GLOBAL": f"{GUEST_HOME}/.gitconfig",
-    }
+    })
     if config.runtime.tty:
         env["TERM"] = os.environ.get("TERM", "xterm-256color")
-    env.update(extra)
-    # Config wins over our defaults, so a config can override PATH or TERM.
-    env.update(config.runtime.env)
+    env.update(extra or {})
 
-    for key, value in env.items():
-        args += ["--setenv", key, value]
-    return args
+    # Named variables lifted from the daemon's environment. This is how a token
+    # reaches the agent without ever being written into a config file.
+    for name in config.runtime.env_from_host:
+        value = os.environ.get(name)
+        if value is not None:
+            env[name] = value
+
+    # A KEY=VALUE file, for the same reason but persisted outside the repo.
+    env.update(_read_env_file(config))
+
+    # The config's own literal values win, so it can override PATH or TERM.
+    env.update(config.runtime.env)
+    return {k: str(v) for k, v in env.items() if v is not None}
+
+
+def _read_env_file(config: ContainerConfig) -> dict[str, str]:
+    """Parse `runtime.env_file`: KEY=VALUE lines, `#` comments, blanks ignored."""
+    path = config.runtime.env_file
+    if path is None:
+        return {}
+    if not path.is_file():
+        raise SandboxError(f"runtime.env_file: no such file: {path}")
+
+    values: dict[str, str] = {}
+    for number, line in enumerate(path.read_text().splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise SandboxError(f"{path}:{number}: expected KEY=VALUE, got {line!r}")
+        key, _, value = line.partition("=")
+        value = value.strip()
+        # Tolerate quoted values, which is how people write them by habit.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
 
 
 _UNITS = {"k": 1024, "m": 1024**2, "g": 1024**3}

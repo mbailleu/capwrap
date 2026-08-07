@@ -141,6 +141,24 @@ def create_app(daemon: Daemon) -> FastAPI:
         snap = c.session.snapshot(tail=max(1, min(rows, 200)))
         return {"container": name, "running": c.running, **snap.to_dict()}
 
+    @app.get("/api/screens")
+    async def screens(rows: int = 12) -> dict:
+        """Every running container's screen tail, in one response.
+
+        The overview polls this. One request rather than one per container: on a
+        Pi with several agents, a fan-out of requests every tick costs more in
+        connection churn than the payload is worth, and they arrive interleaved.
+        """
+        limit = max(1, min(rows, 200))
+        return {
+            "screens": [
+                {"container": c.name, "running": True,
+                 **c.session.snapshot(tail=limit).to_dict()}
+                for c in daemon.containers.values()
+                if c.running and c.session is not None
+            ],
+        }
+
     @app.get("/api/caps/{name}")
     async def caps(name: str) -> list[dict]:
         if name not in daemon.kernel.tasks:

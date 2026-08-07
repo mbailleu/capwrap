@@ -1,0 +1,74 @@
+# A Claude agent pointed at a custom endpoint with a bearer token.
+#
+# The token is *not* in this file. It comes from one of two places, both of
+# which keep it out of git:
+#
+#   env_from_host  lifts named variables from the daemon's own environment
+#   env_file       reads KEY=VALUE lines from a file you keep out of the repo
+#
+# Either way the value is handed to bwrap as its own environment and inherited
+# by the agent -- never passed as `--setenv`, because argv is world-readable
+# through /proc/<pid>/cmdline and would publish the token to every user on the
+# host. `capwrap run --dry-run` masks secret-looking values for the same reason.
+#
+#   export ANTHROPIC_AUTH_TOKEN=sk-ant-...
+#   capwrap up examples/agents/claude-custom-endpoint.toml
+#
+# or put it in a file next to this one (add it to .gitignore):
+#
+#   echo 'ANTHROPIC_AUTH_TOKEN=sk-ant-...' > examples/agents/endpoint.env
+
+name = "claude-endpoint"
+
+[runtime]
+command = ["/opt/claude/claude"]
+cwd     = "/work"
+tty     = true
+
+approvals  = "capwrap"
+auto_allow = ["Read", "Glob", "Grep", "TodoWrite"]
+
+# Lifted from the environment `capwrap up` was started with.
+env_from_host = [
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_CUSTOM_HEADERS",
+]
+
+# Optional: the same thing, persisted. Missing file is an error, so delete this
+# line if you are using env_from_host alone.
+# env_file = "endpoint.env"
+
+[runtime.env]
+# Non-secret settings are fine inline.
+ANTHROPIC_BASE_URL         = "https://gateway.internal.example/v1"
+ANTHROPIC_DEFAULT_OPUS_MODEL = "claude-opus-5"
+
+[runtime.permissions]
+allow = ["Read", "Glob", "Grep", "Bash(git status:*)", "Bash(git diff:*)"]
+ask   = ["Write", "Edit"]
+deny  = ["Bash(sudo *)", "Bash(curl *)"]
+
+[sandbox]
+network  = true          # the endpoint has to be reachable
+hostname = "claude-endpoint"
+unshare  = ["pid", "ipc", "uts", "cgroup"]
+
+[[mounts]]
+src  = "~/.local/bin/claude"
+dest = "/opt/claude/claude"
+mode = "ro"
+
+# Note: no ~/.claude credential copy here. With a token in the environment,
+# Claude does not need the OAuth credentials from your host account -- so this
+# config keeps them on the host entirely.
+[[mounts]]
+src  = "~/capwrap-demo/repo"
+dest = "/work"
+mode = "worktree"
+branch = "capwrap/claude-endpoint"
+base   = "main"
+
+[caps]
+parent = ["send"]

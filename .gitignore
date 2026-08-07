@@ -5,3 +5,5 @@ __pycache__/
 
 # Machine-local tool state, not project configuration.
 .claude/settings.local.json
+endpoint.env
+*.env

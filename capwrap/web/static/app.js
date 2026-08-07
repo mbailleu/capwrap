@@ -587,6 +587,10 @@ function renderMessages() {
 // Rows shown per tile. Enough to see a prompt plus its last output.
 const TILE_ROWS = 14;
 
+// How often the overview refreshes. Deliberately unhurried: this is a glance
+// view, not a terminal, and the box running it is also running the agents.
+const GRID_POLL_MS = 4000;
+
 // pyte reports colours by name; map them onto the palette the terminal uses so
 // a tile and its full-size terminal look like the same program.
 const ANSI_COLORS = {
@@ -620,41 +624,68 @@ function renderRow(runs) {
   }).join('');
 }
 
-async function renderGrid() {
+// The set of tiles currently on screen, so a refresh can update their contents
+// without rebuilding the DOM. Re-rendering the whole grid every tick made it
+// flicker, dropped text selection, and re-bound every listener.
+let gridTiles = new Set();
+let gridBusy = false;
+
+function syncGridTiles(names) {
   const host = $('grid');
-  const running = state.containers.filter((c) => c.running);
-  if (!running.length) {
+  const wanted = names.join(' ');
+  if (wanted === [...gridTiles].join(' ')) return;
+
+  gridTiles = new Set(names);
+  if (!names.length) {
     host.innerHTML = '<div class="empty">No agents are running.</div>';
     return;
   }
-  host.innerHTML = running.map((c) => `
-    <div class="tile" data-name="${escapeHtml(c.name)}">
+  host.innerHTML = names.map((name) => `
+    <div class="tile" data-name="${escapeHtml(name)}">
       <div class="tile-head">
-        <span class="dot running"></span>${escapeHtml(c.name)}
+        <span class="dot running"></span>${escapeHtml(name)}
       </div>
-      <pre id="tile-${escapeHtml(c.name)}">loading…</pre>
+      <pre data-screen="${escapeHtml(name)}">loading…</pre>
     </div>`).join('');
 
   host.querySelectorAll('.tile').forEach((tile) => {
     tile.addEventListener('click', () =>
       select(tile.dataset.name, { focusTerminal: true }));
   });
+}
 
-  // Snapshots come from the daemon's pyte model, so a full-screen TUI renders
-  // correctly instead of showing a half-replayed redraw. We ask for the *tail*:
-  // a shell sits at the bottom of its screen, so the top rows are the least
-  // interesting part to put in a small tile.
-  await Promise.all(running.map(async (container) => {
-    try {
-      const screen = await api(
-        `/api/containers/${container.name}/screen?rows=${TILE_ROWS}`);
-      const element = $(`tile-${container.name}`);
-      if (!element) return;
-      element.innerHTML = screen.styled && screen.styled.length
+async function renderGrid() {
+  // One tick at a time. If the Pi is busy and a refresh outlasts the interval,
+  // stacking more of them only makes it worse.
+  if (gridBusy) return;
+  gridBusy = true;
+  try {
+    // Snapshots come from the daemon's pyte model, so a full-screen TUI renders
+    // correctly instead of showing a half-replayed redraw. We ask for the
+    // *tail*: a shell sits at the bottom of its screen, so the top rows are the
+    // least interesting part to put in a small tile.
+    const { screens } = await api(`/api/screens?rows=${TILE_ROWS}`);
+    syncGridTiles(screens.map((s) => s.container));
+
+    for (const screen of screens) {
+      const element = document.querySelector(
+        `[data-screen="${CSS.escape(screen.container)}"]`);
+      if (!element) continue;
+      const html = screen.styled && screen.styled.length
         ? screen.styled.map(renderRow).join('\n')
         : '<span class="muted">(no output yet)</span>';
-    } catch (_) { /* container may have exited mid-refresh */ }
-  }));
+      // Only touch the DOM when the frame actually changed; an idle agent
+      // otherwise costs a full reflow every tick.
+      if (element.dataset.frame !== html) {
+        element.dataset.frame = html;
+        element.innerHTML = html;
+      }
+    }
+  } catch (_) {
+    /* a container may exit mid-refresh; the next tick picks it up */
+  } finally {
+    gridBusy = false;
+  }
 }
 
 
@@ -706,7 +737,7 @@ function showTab(name) {
   gridTimer = null;
   if (name === 'grid') {
     renderGrid();
-    gridTimer = setInterval(renderGrid, 1500);
+    gridTimer = setInterval(renderGrid, GRID_POLL_MS);
   }
   if (name === 'audit') renderAudit();
   if (name === 'terminal') setTimeout(syncTerminalSize, 30);
@@ -837,6 +868,17 @@ function wire() {
 
   wireGrant();
 }
+
+// A hidden tab should cost nothing; browsers throttle timers but still run them.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    clearInterval(gridTimer);
+    gridTimer = null;
+  } else if (document.querySelector('#tab-grid.active')) {
+    renderGrid();
+    gridTimer = setInterval(renderGrid, GRID_POLL_MS);
+  }
+});
 
 initTheme();
 initResizers();

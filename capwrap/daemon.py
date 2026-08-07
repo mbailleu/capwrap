@@ -186,7 +186,12 @@ class Daemon:
             guest_tools=Path(__file__).resolve().parent / "guest",
         )
 
-        session = PtySession(name=name, argv=argv, env=os.environ.copy())
+        # The container's environment, not the daemon's: handed to bwrap as its
+        # own environ so that tokens never appear in argv.
+        session = PtySession(
+            name=name, argv=argv,
+            env=bwrap_mod.build_env(container.config),
+        )
         session.start()
         container.session = session
         container.obj.state = "running"

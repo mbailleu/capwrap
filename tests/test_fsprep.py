@@ -552,19 +552,12 @@ def test_capwrap_env_and_shared_dir_are_always_present(tmp_path, state_dir):
     paths = ContainerPaths("n")
     argv = argv_for(config, paths, fsprep.prepare(config, paths))
     assert (str(paths.shared), "/shared") in pairs(argv, "--bind")
-    i = argv.index("CAPWRAP_SOCKET")
-    assert argv[i + 1] == "/run/capwrap.sock"
+    assert bwrap_mod.build_env(config)["CAPWRAP_SOCKET"] == "/run/capwrap.sock"
 
 
 def test_config_env_overrides_defaults(tmp_path, state_dir):
     config = make({"name": "n", "runtime": {"env": {"PATH": "/custom"}}}, tmp_path)
-    paths = ContainerPaths("n")
-    argv = argv_for(config, paths, fsprep.prepare(config, paths))
-    setenvs = [
-        (argv[i + 1], argv[i + 2])
-        for i, t in enumerate(argv) if t == "--setenv"
-    ]
-    assert dict(setenvs)["PATH"] == "/custom"
+    assert bwrap_mod.build_env(config)["PATH"] == "/custom"
 
 
 # --------------------------------------------------------------------------
@@ -657,3 +650,133 @@ def test_git_works_inside_a_worktree_sandbox(
     ).stdout
     assert "agent commit" not in main_log
     assert lines  # keep the linter honest about the unused split
+
+
+# --------------------------------------------------------------------------
+# the environment, and keeping secrets out of argv
+# --------------------------------------------------------------------------
+
+
+def test_no_environment_values_appear_in_argv(tmp_path, state_dir):
+    """The property that matters: /proc/<pid>/cmdline is world-readable.
+
+    `--setenv ANTHROPIC_AUTH_TOKEN sk-ant-...` publishes the token to every user
+    on the host. Passing the environment as bwrap's own environ keeps it in
+    /proc/<pid>/environ, which is readable only by the owner.
+    """
+    secret = "sk-ant-DO-NOT-LEAK-abcdef123456"
+    config = make({
+        "name": "n",
+        "runtime": {"env": {"ANTHROPIC_AUTH_TOKEN": secret}},
+    }, tmp_path)
+    paths = ContainerPaths("n")
+    argv = argv_for(config, paths, fsprep.prepare(config, paths))
+
+    assert "--setenv" not in argv
+    assert not any(secret in token for token in argv)
+    # ...and it does reach the container, by the other route.
+    assert bwrap_mod.build_env(config)["ANTHROPIC_AUTH_TOKEN"] == secret
+
+
+def test_env_from_host_lifts_named_variables(tmp_path, state_dir, monkeypatch):
+    """How a token reaches an agent without being written into a config file."""
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-from-the-daemon")
+    monkeypatch.setenv("SOMETHING_ELSE", "not requested")
+
+    config = make({
+        "name": "n",
+        "runtime": {"env_from_host": ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"]},
+    }, tmp_path)
+    env = bwrap_mod.build_env(config)
+
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-ant-from-the-daemon"
+    assert "SOMETHING_ELSE" not in env, "only named variables cross the boundary"
+    # Absent on the host means absent in the container, not an empty string.
+    assert "ANTHROPIC_BASE_URL" not in env
+
+
+def test_the_daemons_environment_does_not_leak_in_by_default(
+    tmp_path, state_dir, monkeypatch
+):
+    monkeypatch.setenv("MY_PRIVATE_THING", "should not be visible")
+    config = make({"name": "n"}, tmp_path)
+    assert "MY_PRIVATE_THING" not in bwrap_mod.build_env(config)
+
+
+def test_clear_env_false_inherits_the_daemons_environment(
+    tmp_path, state_dir, monkeypatch
+):
+    monkeypatch.setenv("MY_PRIVATE_THING", "inherited on purpose")
+    config = make({"name": "n", "sandbox": {"clear_env": False}}, tmp_path)
+    assert bwrap_mod.build_env(config)["MY_PRIVATE_THING"] == "inherited on purpose"
+
+
+def test_env_file_is_read_and_resolves_against_the_config(tmp_path, state_dir):
+    (tmp_path / "secrets.env").write_text(
+        "# a comment\n"
+        "\n"
+        "ANTHROPIC_BASE_URL=https://gateway.internal/v1\n"
+        'ANTHROPIC_AUTH_TOKEN="sk-ant-quoted-value"\n'
+        "PADDED = spaces around it \n"
+    )
+    config = make({
+        "name": "n", "runtime": {"env_file": "secrets.env"},
+    }, tmp_path)
+    env = bwrap_mod.build_env(config)
+
+    assert env["ANTHROPIC_BASE_URL"] == "https://gateway.internal/v1"
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-ant-quoted-value", "quotes stripped"
+    assert env["PADDED"] == "spaces around it"
+
+
+def test_a_malformed_env_file_says_which_line(tmp_path, state_dir):
+    (tmp_path / "bad.env").write_text("GOOD=1\nthis is not an assignment\n")
+    config = make({"name": "n", "runtime": {"env_file": "bad.env"}}, tmp_path)
+    with pytest.raises(SandboxError, match="bad.env:2"):
+        bwrap_mod.build_env(config)
+
+
+def test_a_missing_env_file_is_an_error_not_a_silent_skip(tmp_path, state_dir):
+    config = make({"name": "n", "runtime": {"env_file": "nope.env"}}, tmp_path)
+    with pytest.raises(SandboxError, match="no such file"):
+        bwrap_mod.build_env(config)
+
+
+def test_config_env_wins_over_host_and_file(tmp_path, state_dir, monkeypatch):
+    monkeypatch.setenv("PICK_ME", "from host")
+    (tmp_path / "e.env").write_text("PICK_ME=from file\n")
+    config = make({
+        "name": "n",
+        "runtime": {
+            "env_from_host": ["PICK_ME"],
+            "env_file": "e.env",
+            "env": {"PICK_ME": "from config"},
+        },
+    }, tmp_path)
+    assert bwrap_mod.build_env(config)["PICK_ME"] == "from config"
+
+
+@pytest.mark.parametrize("name, secret", [
+    ("ANTHROPIC_AUTH_TOKEN", True),
+    ("ANTHROPIC_API_KEY", True),
+    ("MY_SECRET", True),
+    ("DB_PASSWORD", True),
+    ("ANTHROPIC_BASE_URL", False),
+    ("PATH", False),
+    ("TERM", False),
+])
+def test_secret_names_are_recognised_for_redaction(name, secret):
+    assert bwrap_mod.is_secret(name) is secret
+
+
+def test_redaction_masks_values_but_keeps_names(tmp_path, state_dir):
+    """`--dry-run` has to stay useful without printing the token."""
+    config = make({
+        "name": "n",
+        "runtime": {"env": {"ANTHROPIC_AUTH_TOKEN": "sk-ant-xyz",
+                            "ANTHROPIC_BASE_URL": "https://example/v1"}},
+    }, tmp_path)
+    shown = bwrap_mod.redact(bwrap_mod.build_env(config))
+
+    assert shown["ANTHROPIC_AUTH_TOKEN"] == "<redacted>"
+    assert shown["ANTHROPIC_BASE_URL"] == "https://example/v1"

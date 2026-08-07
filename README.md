@@ -320,6 +320,47 @@ Write: /work/hello.txt
 replies `DONE`. **Deny** → the file is never created and Claude tells you it was
 blocked. Either way the decision is in the audit log next to the request.
 
+## Environment variables, and endpoint credentials
+
+`[runtime.env]` sets variables inline. For anything secret, use one of the two
+sources that keep it out of the config file:
+
+```toml
+[runtime]
+# Named variables lifted from the environment `capwrap up` was started with.
+env_from_host = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"]
+# Or a KEY=VALUE file you keep out of the repo.
+env_file = "endpoint.env"
+
+[runtime.env]
+ANTHROPIC_BASE_URL = "https://gateway.internal.example/v1"
+```
+
+Precedence is `[runtime.env]` > `env_file` > `env_from_host` > capwrap's
+defaults. Only the variables you name cross the boundary; the daemon's own
+environment does not leak in (set `sandbox.clear_env = false` if you actually
+want it to).
+
+For a custom endpoint with a bearer token, Claude Code reads `ANTHROPIC_BASE_URL`,
+`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` and `ANTHROPIC_CUSTOM_HEADERS`. See
+`examples/agents/claude-custom-endpoint.toml` — with a token in the environment
+the agent needs no copy of your host `~/.claude` credentials at all.
+
+**Why not `--setenv`.** bwrap can set variables on its command line, and capwrap
+used to. But `/proc/<pid>/cmdline` is world-readable:
+
+```
+$ ls -l /proc/<pid>/cmdline /proc/<pid>/environ
+-r--r--r--  cmdline      ← every user on the host can read this
+-r--------  environ      ← only the owner
+```
+
+so `--setenv ANTHROPIC_AUTH_TOKEN sk-ant-...` publishes the token to anyone with
+a shell on the box. The environment is instead handed to bwrap as its own and
+inherited by the agent, which puts it in `environ` where it belongs. A test
+asserts that no environment value ever appears in argv, and
+`capwrap run --dry-run` masks values whose names look like secrets.
+
 ## Agents discover capctl on their own
 
 Every container gets a Claude Code skill at
@@ -493,7 +534,7 @@ capwrap/
   ipc/             protocol · per-container socket server · mailboxes
   guest/           capctl, hook.py — the only things an agent sees
   web/             FastAPI + a vanilla-JS console, xterm.js vendored locally
-tests/            147 tests; `-m sandbox` ones need a working bwrap
+tests/            163 tests; `-m sandbox` ones need a working bwrap
 ```
 
 The split that matters: `kernel/` decides what is permitted and performs no I/O;

@@ -212,6 +212,11 @@ class RuntimeSpec(Base):
     cwd: str = "/"
     tty: bool = True
     env: dict[str, str] = Field(default_factory=dict)
+    #: Names lifted from the daemon's own environment. The way to give an agent
+    #: a token without writing it into a config file that lands in git.
+    env_from_host: list[str] = Field(default_factory=list)
+    #: A KEY=VALUE file, read at launch. Same purpose, persisted outside the repo.
+    env_file: Path | None = None
     #: How the container is told a message arrived: written to /shared/inbox
     #: ("file"), typed into its PTY ("pty"), or not at all.
     notify: Literal["file", "pty", "none"] = "file"
@@ -352,6 +357,8 @@ class ContainerConfig(Base):
                 mount.src = _abs(mount.src, base_dir)
             if mount.mode == "worktree" and not mount.branch and not mount.detach:
                 mount.branch = f"capwrap/{self.name}"
+        if self.runtime.env_file is not None:
+            self.runtime.env_file = _abs(self.runtime.env_file, base_dir)
         for spec in self.files:
             if spec.src is not None:
                 spec.src = _abs(spec.src, base_dir)
