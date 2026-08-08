@@ -401,6 +401,8 @@ class Daemon:
             return k.ctr_kill(actor, int(args["slot"]), int(args.get("signal", 15)))
         if op == "ctr.signal":
             return k.ctr_signal(actor, int(args["slot"]), int(args.get("signal", 2)))
+        if op == "ctr.output":
+            return k.ctr_output(actor, int(args["slot"]), int(args.get("rows", 24)))
         if op == "ctr.input":
             return k.ctr_input(actor, int(args["slot"]), str(args["data"]))
         if op == "ctr.spawn":
@@ -553,6 +555,24 @@ class Daemon:
         if container is None or container.session is None:
             raise CapwrapError(f"{name} is not running")
         container.session.write(data)
+
+    def read_output(self, name: str, rows: int) -> dict:
+        """The target's current screen, as the capability kernel authorised.
+
+        The pyte screen rather than the raw byte log: a caller wants to know what
+        the agent is *showing* -- which option is highlighted, what the prompt
+        says -- and replaying bytes cannot answer that without a terminal
+        emulator on the other end.
+        """
+        container = self.containers.get(name)
+        if container is None or container.session is None:
+            return {"container": name, "running": False, "lines": [], "cursor": None}
+        snapshot = container.session.snapshot(tail=max(1, min(rows, 200)))
+        return {
+            "container": name,
+            "running": container.running,
+            **snapshot.to_dict(),
+        }
 
     def spawn_container(self, config: ContainerConfig, parent: str) -> ContainerObject:
         container = self.register(config, parent=parent)

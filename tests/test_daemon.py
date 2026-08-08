@@ -1005,3 +1005,130 @@ async def test_dismissing_frees_the_name_for_reuse(daemon, tmp_path):
 async def test_dismissing_an_unknown_container_is_an_error(daemon, tmp_path):
     with pytest.raises(CapwrapError, match="no such container"):
         await daemon.destroy("never-existed")
+
+
+# ==========================================================================
+# one agent driving another
+# ==========================================================================
+
+
+async def linked_pair(daemon, tmp_path, rights, child_command):
+    """A driver holding `rights` on a child that is running `child_command`."""
+    daemon.register(config(
+        "driver", tmp_path,
+        caps={"peers": [{"container": "child", "rights": rights}]},
+    ))
+    daemon.register(config(
+        "child", tmp_path, runtime={"command": child_command, "tty": True},
+    ))
+    daemon.link_all_peers()
+    for name in ("driver", "child"):
+        c = daemon.containers[name]
+        c.server = await daemon._serve_container(c)
+    return daemon.containers["driver"], daemon.containers["child"]
+
+
+async def peer_slot(driver) -> int:
+    caps = (await request(driver.paths.socket, "cap.list")).result
+    return [c["slot"] for c in caps if c["label"] == "peer:child"][0]
+
+
+async def test_reading_output_needs_its_own_right(daemon, tmp_path):
+    """INSPECT is not enough.
+
+    Knowing a container exists is a far smaller thing than reading everything on
+    its screen, which for an agent is its prompts, file contents and whatever it
+    has been told.
+    """
+    driver, _ = await linked_pair(
+        daemon, tmp_path, ["send", "inspect"], ["/bin/sleep", "5"])
+    slot = await peer_slot(driver)
+
+    status = await request(driver.paths.socket, "ctr.status", {"slot": slot})
+    assert status.ok, "inspect should still work"
+
+    denied = await request(driver.paths.socket, "ctr.output", {"slot": slot})
+    assert not denied.ok
+    assert denied.code == "insufficient_rights"
+
+
+async def test_typing_needs_its_own_right(daemon, tmp_path):
+    driver, _ = await linked_pair(
+        daemon, tmp_path, ["send", "inspect", "read_output"], ["/bin/sleep", "5"])
+    slot = await peer_slot(driver)
+
+    denied = await request(
+        driver.paths.socket, "ctr.input", {"slot": slot, "data": "x"})
+    assert not denied.ok
+    assert denied.code == "insufficient_rights"
+
+
+@pytest.mark.sandbox
+async def test_an_agent_can_read_and_drive_another_agents_terminal(
+    daemon, tmp_path, require_sandbox
+):
+    """The parent-drives-child case: read the screen, answer with keystrokes.
+
+    The child runs a selection prompt that only responds to arrow keys and
+    Enter -- exactly the shape of an interactive tool prompt, and impossible to
+    answer by sending text.
+    """
+    script = r"""
+        choice=1
+        draw() {
+            printf '\033[2J\033[H'
+            echo 'Pick one:'
+            [ $choice = 1 ] && echo '> alpha' || echo '  alpha'
+            [ $choice = 2 ] && echo '> beta'  || echo '  beta'
+        }
+        draw
+        while true; do
+            IFS= read -rsn1 c || exit 1
+            if [ "$c" = "$(printf '\033')" ]; then
+                IFS= read -rsn2 rest
+                case "$rest" in
+                    '[A') choice=1 ;;
+                    '[B') choice=2 ;;
+                esac
+                draw
+            elif [ "$c" = "" ]; then
+                printf '\033[2J\033[H'
+                [ $choice = 1 ] && echo 'CHOSE-ALPHA' || echo 'CHOSE-BETA'
+                sleep 3; exit 0
+            fi
+        done
+    """
+    driver, child = await linked_pair(
+        daemon, tmp_path,
+        ["send", "inspect", "read_output", "write_input"],
+        ["/bin/bash", "-c", script],
+    )
+    await daemon.start("child")
+    await asyncio.sleep(1.5)
+    slot = await peer_slot(driver)
+
+    # 1. Read the child's screen through the capability.
+    screen = await request(
+        driver.paths.socket, "ctr.output", {"slot": slot, "rows": 10})
+    assert screen.ok, screen.message
+    rendered = "\n".join(screen.result["lines"])
+    assert "Pick one:" in rendered
+    assert "> alpha" in rendered, rendered
+
+    # 2. Answer it with keystrokes that are not text at all.
+    down = await request(
+        driver.paths.socket, "ctr.input", {"slot": slot, "data": "\x1b[B"})
+    assert down.ok, down.message
+    await asyncio.sleep(0.8)
+
+    moved = await request(
+        driver.paths.socket, "ctr.output", {"slot": slot, "rows": 10})
+    assert "> beta" in "\n".join(moved.result["lines"]), moved.result["lines"]
+
+    # 3. Enter is a carriage return; a newline would not be seen.
+    await request(driver.paths.socket, "ctr.input", {"slot": slot, "data": "\r"})
+    await asyncio.sleep(1.0)
+
+    final = await request(
+        driver.paths.socket, "ctr.output", {"slot": slot, "rows": 10})
+    assert "CHOSE-BETA" in "\n".join(final.result["lines"]), final.result["lines"]

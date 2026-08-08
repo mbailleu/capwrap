@@ -33,6 +33,7 @@ AGENT_OPS = frozenset({
     "ctr.kill",
     "ctr.signal",
     "ctr.input",
+    "ctr.output",
     "ctr.spawn",
     "ds.map",
     "ask",

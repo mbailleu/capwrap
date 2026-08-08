@@ -75,6 +75,7 @@ class Hooks(Protocol):
     def kill_container(self, name: str, signal: int) -> None: ...
     def signal_container(self, name: str, signal: int) -> None: ...
     def write_input(self, name: str, data: str) -> None: ...
+    def read_output(self, name: str, rows: int) -> dict: ...
     def spawn_container(
         self, config: ContainerConfig, parent: str
     ) -> "ContainerObject": ...
@@ -98,6 +99,9 @@ class NullHooks:
 
     def write_input(self, name: str, data: str) -> None:
         pass
+
+    def read_output(self, name: str, rows: int) -> dict:
+        return {"lines": [], "running": False}
 
     def spawn_container(self, config: ContainerConfig, parent: str):
         raise CapabilityError("spawning is not available in this context")
@@ -632,6 +636,20 @@ class CapKernel:
             raise InsufficientRights(f"slot {slot} does not name a container")
         self.hooks.write_input(obj.name, data)
         return {"wrote": len(data), "to": obj.name}
+
+    def ctr_output(self, actor: str, slot: int, rows: int = 24) -> dict:
+        """Read what another container's terminal is showing.
+
+        Needs READ_OUTPUT, which is deliberately separate from INSPECT: knowing
+        that a container exists and is running is a much smaller thing than
+        being able to read everything on its screen, which for an agent means
+        its prompts, its file contents and whatever it has been told.
+        """
+        _task, ref = self._checked(actor, "ctr.output", slot, Rights.READ_OUTPUT)
+        obj = self.objects[ref.oid]
+        if not isinstance(obj, ContainerObject):
+            raise InsufficientRights(f"slot {slot} does not name a container")
+        return self.hooks.read_output(obj.name, rows)
 
     def ctr_status(self, actor: str, slot: int) -> dict:
         _task, ref = self._checked(actor, "ctr.status", slot, Rights.INSPECT)

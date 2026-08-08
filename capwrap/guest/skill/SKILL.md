@@ -72,6 +72,30 @@ capctl recv --wait           # block until something arrives
 Messages also appear as files in `/shared/inbox/`, so check there if you were
 not watching. Needs `send` on that peer.
 
+## Watching and driving another agent
+
+With `read_output` on a peer you can see its terminal; with `write_input` you
+can type at it. Together they let you drive an agent through an interactive
+prompt it cannot answer any other way.
+
+```
+capctl screen peer:helper                 # what is it showing right now?
+capctl type peer:helper "run the tests"   # text, no Enter
+capctl type peer:helper "yes" --enter     # text then Enter
+capctl keys peer:helper down down enter   # arrows, Tab, Escape, ctrl-c ...
+```
+
+`capctl keys` exists because a selection prompt is answered with arrow keys and
+Enter, and none of those are characters you can type. Enter sends a carriage
+return, which is what a terminal actually delivers -- a newline is often ignored.
+
+Read the screen again after each keystroke rather than sending a whole sequence
+blind: you are driving a program that redraws, and what is highlighted after one
+keypress tells you whether the next one is right.
+
+These are two separate rights, and neither comes with `inspect`. Knowing a
+container exists is much less than reading everything on its screen.
+
 ## Sharing files with another agent
 
 ```

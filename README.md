@@ -197,6 +197,8 @@ capctl grant peer:dev-b 3 --rights read     # delegate, diminished
 capctl revoke 3                    # take back everything I gave from slot 3
 capctl map peer:dev-b 3 findings   # put a dataspace in their /shared
 capctl spawn factory child.toml    # create a child, within quota
+capctl screen peer:dev-b           # read its terminal (needs read_output)
+capctl keys peer:dev-b down enter  # drive its TUI  (needs write_input)
 capctl ask "may I install curl?"   # ask the human (a question, not a grant)
 capctl request factory --quota 2   # ask for authority; approval grants it
 ```
@@ -422,6 +424,32 @@ curl -X POST localhost:8420/api/caps/grant -H 'Content-Type: application/json' \
 A second grant on the same container gets a distinct label (`peer:dev-b#2`), so
 `capctl kill peer:dev-b#2` stays unambiguous.
 
+## One agent driving another
+
+A container holding `read_output` on a peer can read its terminal; with
+`write_input` it can type at it. That is enough for a parent agent to drive a
+child through an interactive prompt:
+
+```bash
+capctl screen peer:helper                 # what is on its screen now
+capctl keys   peer:helper down down enter # arrows, Tab, Escape, ctrl-<key>, F1-F12
+capctl type   peer:helper "yes" --enter   # text, optionally followed by Enter
+```
+
+`keys` is the part that matters for a tool prompt: a selection list is answered
+with arrow keys and Enter, and neither is a character. Enter sends a **carriage
+return**, which is what a terminal delivers in raw mode — a newline is often
+ignored entirely by a full-screen TUI.
+
+Reading returns the daemon's `pyte` screen model, not a byte log, so the caller
+sees *what is currently displayed* — including which option is highlighted —
+without needing a terminal emulator of its own.
+
+They are two separate rights, and neither is implied by `inspect`. Knowing that
+a container exists is a much smaller thing than reading everything on its
+screen, which for an agent means its prompts, its file contents and whatever it
+has been told.
+
 ## Dynamic mapping
 
 `capctl map` hands a dataspace to another agent. *How* that lands depends on the
@@ -581,7 +609,7 @@ capwrap/
   ipc/             protocol · per-container socket server · mailboxes
   guest/           capctl, hook.py — the only things an agent sees
   web/             FastAPI + a vanilla-JS console, xterm.js vendored locally
-tests/            181 tests; `-m sandbox` ones need a working bwrap
+tests/            184 tests; `-m sandbox` ones need a working bwrap
 ```
 
 The split that matters: `kernel/` decides what is permitted and performs no I/O;

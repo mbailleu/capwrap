@@ -122,6 +122,56 @@ def resolve_slot(value: str) -> int:
 
 
 # --------------------------------------------------------------------------
+# keystrokes
+# --------------------------------------------------------------------------
+
+# Byte sequences a terminal actually delivers for keys that are not characters.
+# Needed to drive another agent's TUI -- a selection prompt is answered with
+# arrows and Enter, and none of those can be expressed as text.
+KEYS = {
+    "up": "\x1b[A", "down": "\x1b[B", "right": "\x1b[C", "left": "\x1b[D",
+    "home": "\x1b[H", "end": "\x1b[F",
+    "pageup": "\x1b[5~", "pagedown": "\x1b[6~",
+    "insert": "\x1b[2~", "delete": "\x1b[3~",
+    # Enter is a carriage return, not a newline. A TTY in raw mode -- which is
+    # what any full-screen TUI puts itself in -- receives \r when you press it,
+    # and many prompts ignore \n entirely.
+    "enter": "\r", "return": "\r", "cr": "\r", "newline": "\n",
+    "tab": "\t", "backtab": "\x1b[Z", "shift-tab": "\x1b[Z",
+    "space": " ", "backspace": "\x7f", "escape": "\x1b", "esc": "\x1b",
+}
+KEYS.update({f"f{n}": seq for n, seq in enumerate(
+    ["\x1bOP", "\x1bOQ", "\x1bOR", "\x1bOS",
+     "\x1b[15~", "\x1b[17~", "\x1b[18~", "\x1b[19~",
+     "\x1b[20~", "\x1b[21~", "\x1b[23~", "\x1b[24~"], start=1)})
+
+
+def key_sequence(name: str) -> str:
+    """Translate a key name into what a terminal would send.
+
+    Also accepts `ctrl-c` style names, and `\x03`-ish escapes for anything the
+    table does not cover.
+    """
+    key = name.strip().lower()
+    if key in KEYS:
+        return KEYS[key]
+    if key.startswith(("ctrl-", "c-", "^")) :
+        letter = key.split("-", 1)[-1].lstrip("^")
+        if len(letter) == 1 and letter.isalpha():
+            return chr(ord(letter.lower()) - 96)
+    if key.startswith("alt-") and len(key) == 5:
+        return "\x1b" + key[-1]
+    try:
+        # Last resort: a literal escape, so unusual keys stay reachable.
+        return name.encode().decode("unicode_escape")
+    except UnicodeDecodeError:
+        raise CapctlError(
+            f"unknown key {name!r}; known: {', '.join(sorted(KEYS))}, "
+            "ctrl-<letter>, alt-<letter>"
+        ) from None
+
+
+# --------------------------------------------------------------------------
 # output helpers
 # --------------------------------------------------------------------------
 
@@ -245,8 +295,32 @@ def cmd_interrupt(args):
 
 
 def cmd_type(args):
-    data = args.data if args.data.endswith("\n") else args.data + "\n"
+    data = args.data
+    if args.enter:
+        data += "\r"
     emit(call("ctr.input", {"slot": resolve_slot(args.slot), "data": data}), args.json)
+
+
+def cmd_keys(args):
+    """Send named keys, so a TUI can be driven rather than only typed at."""
+    data = "".join(key_sequence(k) for k in args.keys)
+    result = call("ctr.input", {"slot": resolve_slot(args.slot), "data": data})
+    if args.json:
+        emit(result, True)
+    else:
+        print(f"sent {len(args.keys)} key(s) to {result['to']}")
+
+
+def cmd_screen(args):
+    """Read what another container is showing."""
+    result = call("ctr.output", {"slot": resolve_slot(args.slot), "rows": args.rows})
+    if args.json:
+        emit(result, True)
+        return
+    if not result.get("running"):
+        print(f"({result.get('container', '?')} is not running)")
+    for line in result.get("lines", []):
+        print(line.rstrip())
 
 
 def cmd_spawn(args):
@@ -396,10 +470,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--signal", type=int, default=2)
     p.set_defaults(func=cmd_interrupt)
 
-    p = sub.add_parser("type", help="type at another container's terminal")
+    p = sub.add_parser("type", help="type text at another container's terminal")
     p.add_argument("slot")
     p.add_argument("data")
+    p.add_argument("--enter", action="store_true",
+                   help="press Enter afterwards (sends CR, as a terminal does)")
     p.set_defaults(func=cmd_type)
+
+    p = sub.add_parser(
+        "keys",
+        help="send named keys: up down left right tab enter escape ctrl-c ...",
+    )
+    p.add_argument("slot")
+    p.add_argument("keys", nargs="+")
+    p.set_defaults(func=cmd_keys)
+
+    p = sub.add_parser("screen", help="read another container's terminal")
+    p.add_argument("slot")
+    p.add_argument("--rows", type=int, default=24)
+    p.set_defaults(func=cmd_screen)
 
     p = sub.add_parser("spawn", help="create a container through a factory capability")
     p.add_argument("factory", help="slot of the factory capability")
