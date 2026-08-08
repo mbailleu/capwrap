@@ -254,6 +254,31 @@ def check_git() -> Check:
     return Check("git", True, proc.stdout.strip() or path, optional=True)
 
 
+def check_live_remapping() -> Check:
+    """Can the daemon bind-mount into a container that is already running?
+
+    Determined by doing it: the failure is a capability check inside the kernel,
+    and nothing observable from outside predicts it. Optional, because the
+    shared-directory backend covers the same ground without privilege -- less
+    precisely, since it cannot alias a directory.
+    """
+    from . import nsmount
+
+    ok, detail = nsmount.available()
+    if ok:
+        return Check("live remapping (nsmount)", True, detail, optional=True)
+    return Check(
+        "live remapping (nsmount)", False, detail,
+        hint=(
+            "falling back to the 'shared' backend, which copies into the "
+            "target's /shared. For real bind mounts, run the daemon with "
+            "CAP_SYS_ADMIN (e.g. a systemd unit with "
+            "AmbientCapabilities=CAP_SYS_ADMIN)"
+        ),
+        optional=True,
+    )
+
+
 def check_state_dir() -> Check:
     root = state_root()
     try:
@@ -280,6 +305,7 @@ def run_all() -> Report:
     report.add(check_kernel_overlay())
     report.add(check_fuse_overlayfs())
     report.add(check_git())
+    report.add(check_live_remapping())
     return report
 
 
@@ -302,6 +328,11 @@ def format_report(report: Report, color: bool = True) -> str:
 
     backend = report.overlay_backend
     lines.append("")
+    mapping = report.get("live remapping (nsmount)")
+    if mapping is not None:
+        lines.append(
+            f"  mapping backend: {paint('nsmount' if mapping.ok else 'shared', '36')}"
+        )
     if backend:
         lines.append(f"  overlay backend: {paint(backend, '36')}")
     else:

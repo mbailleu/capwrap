@@ -33,7 +33,8 @@ from .kernel.policy import contains as policy_contains
 from .kernel.rights import VALID_RIGHTS, Rights, parse_rights
 from .paths import ContainerPaths, db_path, force_rmtree, state_root
 from .runtime import bwrap as bwrap_mod
-from .runtime import fsprep, probe
+from .runtime import fsprep, mapper as mapper_mod
+from .runtime import probe
 from .runtime.supervisor import PtySession
 
 OPERATOR = "operator"
@@ -95,6 +96,16 @@ class Container:
     def running(self) -> bool:
         return self.session is not None and self.session.running
 
+    # -- the bits a Mapper needs (see runtime/mapper.py) ------------------
+
+    @property
+    def shared_dir(self) -> Path:
+        return self.paths.shared
+
+    @property
+    def pid(self) -> int | None:
+        return self.session.pid if self.running else None
+
     def status(self) -> dict:
         return {
             **self.obj.describe(),
@@ -118,6 +129,9 @@ class Daemon:
         self._events: list[asyncio.Queue] = []
         self._overlay_backend: str | None = None
         self._bwrap: str | None = None
+        #: Chosen on first use, by trying it -- see runtime/mapper.select.
+        self._mapper = None
+        self.mapper_detail = ""
 
     # ==================================================================
     # host capability discovery
@@ -545,54 +559,41 @@ class Daemon:
         asyncio.ensure_future(self.start(config.name))
         return container.obj
 
-    def materialise(self, target: str, source: Path, dest_name: str, mode: str) -> str:
-        """Place a dataspace into a container's /shared.
+    @property
+    def mapper(self):
+        """The mapping backend, selected on first use."""
+        if self._mapper is None:
+            self._mapper, self.mapper_detail = mapper_mod.select(
+                os.environ.get("CAPWRAP_MAPPING_BACKEND", "auto")
+            )
+            self.audit.record(
+                ROOT, "mapper.select", allowed=True,
+                target=self._mapper.name, detail=self.mapper_detail,
+            )
+        return self._mapper
 
-        This is the "map now, live" path: `/shared` is a plain host directory
-        already bind-mounted into the running sandbox, so anything written here
-        appears immediately without touching the container's mount namespace.
-        Real bind mounts into a running container (via nsenter into its user and
-        mount namespaces) would slot in behind this same interface.
+    def materialise(self, target: str, source: Path, dest_name: str, mode: str) -> str:
+        """Put a dataspace where the receiving container can reach it.
+
+        Which mechanism that is depends on the backend: a bind mount into the
+        live container when the daemon is privileged enough, a copy or symlink
+        into its /shared otherwise. `ds_map` has already decided that the
+        mapping is permitted; this only carries it out.
         """
         container = self.containers.get(target)
         if container is None:
             raise CapwrapError(f"no such container: {target}")
-
-        safe_name = dest_name.strip("/").replace("..", "_").replace("/", "_")
-        if not safe_name:
-            raise CapwrapError("a destination name is required")
-        destination = container.paths.shared / safe_name
-
-        if destination.exists() or destination.is_symlink():
-            if destination.is_dir() and not destination.is_symlink():
-                shutil.rmtree(destination)
-            else:
-                destination.unlink()
-
-        if mode == "copy":
-            if source.is_dir():
-                shutil.copytree(source, destination, symlinks=True)
-            else:
-                shutil.copy2(source, destination)
-        else:
-            # A symlink aliases the two containers to the same bytes, which is
-            # what distinguishes MAP from COPY.
-            destination.symlink_to(source)
-
-        return f"{target}:{safe_name}"
+        return self.mapper.materialise(container, source, dest_name, mode)
 
     def unmaterialise(self, token: str) -> None:
         """Undo a `materialise`, when its mapping is revoked."""
-        target, _, name = token.partition(":")
-        container = self.containers.get(target)
-        if container is None or not name:
+        parts = token.split(":")
+        name = parts[1] if len(parts) >= 3 else (parts[0] if parts else "")
+        container = self.containers.get(name)
+        if container is None:
             return
-        path = container.paths.shared / name
-        if path.is_symlink() or path.is_file():
-            with contextlib.suppress(OSError):
-                path.unlink()
-        elif path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
+        with contextlib.suppress(Exception):
+            self.mapper.unmaterialise(container, token)
 
     # ==================================================================
     # operator interaction

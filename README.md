@@ -422,6 +422,53 @@ curl -X POST localhost:8420/api/caps/grant -H 'Content-Type: application/json' \
 A second grant on the same container gets a distinct label (`peer:dev-b#2`), so
 `capctl kill peer:dev-b#2` stays unambiguous.
 
+## Dynamic mapping
+
+`capctl map` hands a dataspace to another agent. *How* that lands depends on the
+backend, and they differ in what "map" means:
+
+| backend | mechanism | aliases? | privilege |
+|---|---|---|---|
+| `shared` | copy or symlink into the target's `/shared` | only if the source is already reachable inside | none |
+| `nsmount` | bind mount into the running container's mount namespace | yes, fully | `CAP_SYS_ADMIN` on the host |
+
+`nsmount` is the real thing: both containers look at the same filesystem
+objects, a write on one side is visible on the other immediately, and a
+directory can be mapped as a directory. It works by detaching the source with
+`open_tree(OPEN_TREE_CLONE)` on the host, then joining the container's user and
+mount namespaces and reattaching it with `move_mount`.
+
+Two details that are easy to get wrong, both learned the hard way:
+
+- The host path must be captured **before** the namespace switch. Once you are
+  in the container's mount namespace the host filesystem is unreachable by path,
+  because bwrap pivot_root'd away from it. A detached mount fd survives; a path
+  does not.
+- The user and mount namespaces must be joined in **one** `setns` call with a
+  pidfd. Joining them separately fails with `EPERM`, because the mount namespace
+  check is made against the user namespace in the pending credential set.
+
+**Which one you get.** `capwrap doctor` reports it, and decides by *doing* it —
+attempting a real mount into a throwaway container — because the failure is a
+capability check deep in the kernel that nothing observable from outside
+predicts:
+
+```
+  [warn] live remapping (nsmount): CAP_SYS_ADMIN is required on the host
+  mapping backend: shared
+```
+
+An unprivileged daemon can join a container's namespaces and even reads back a
+full capability set there, but `open_tree` and `mount` still return EPERM. To
+get `nsmount`, run the daemon with the capability — e.g. a systemd unit with
+`AmbientCapabilities=CAP_SYS_ADMIN` — and the same code path succeeds. Force a
+backend with `CAPWRAP_MAPPING_BACKEND=shared|nsmount|auto`; naming one that is
+unusable is an error rather than a silent downgrade, so you are never told a
+mapping is an alias when it is a copy.
+
+`mode="copy"` always copies, on either backend: there is no aliasing to
+preserve, and a copy survives the container restarting where a mount does not.
+
 ## Killing a container cleanly
 
 `capwrap stop`, the web UI's **Stop**, `capctl kill`, and a daemon crash all end
@@ -530,11 +577,11 @@ capwrap/
   config.py        TOML → validated ContainerConfig
   daemon.py        containers, PTYs, sockets; implements the kernel's effects
   kernel/          rights · captable · mapdb · objects · audit · policy · kernel
-  runtime/         probe · fsprep · gitwt · bwrap · supervisor
+  runtime/         probe · fsprep · gitwt · bwrap · supervisor · mapper · nsmount
   ipc/             protocol · per-container socket server · mailboxes
   guest/           capctl, hook.py — the only things an agent sees
   web/             FastAPI + a vanilla-JS console, xterm.js vendored locally
-tests/            163 tests; `-m sandbox` ones need a working bwrap
+tests/            181 tests; `-m sandbox` ones need a working bwrap
 ```
 
 The split that matters: `kernel/` decides what is permitted and performs no I/O;
@@ -555,9 +602,7 @@ Working: all mount modes, the capability kernel with recursive revocation,
 per-container IPC, agent-to-agent messaging, dataspace mapping, factories with
 quotas, the web console, and approval routing.
 
-Not yet: **live remapping into a running container.** `capctl map` currently
-materialises into the target's `/shared`, which is a host directory already bound
-into the sandbox, so it appears immediately. True dynamic bind-mounting (the
-daemon entering the target's user and mount namespaces via `nsenter`, where it
-holds `CAP_SYS_ADMIN`) slots in behind the same `materialise`/`unmaterialise`
-interface in `daemon.py`.
+**Dynamic mapping** is implemented (`runtime/nsmount.py`, `runtime/mapper.py`)
+and verified end to end, but only usable when the daemon holds `CAP_SYS_ADMIN`
+on the host — see "Dynamic mapping" above. Unprivileged, it falls back to the
+shared-directory backend, which cannot truly alias a directory.
