@@ -1132,3 +1132,32 @@ async def test_an_agent_can_read_and_drive_another_agents_terminal(
     final = await request(
         driver.paths.socket, "ctr.output", {"slot": slot, "rows": 10})
     assert "CHOSE-BETA" in "\n".join(final.result["lines"]), final.result["lines"]
+
+
+async def test_an_answered_question_is_not_replayed_as_open(daemon, tmp_path):
+    """The operator inbox is history and survives a page reload.
+
+    Without recording the outcome, a question you already decided comes back
+    looking exactly like one still waiting on you.
+    """
+    daemon.register(config("asker", tmp_path))
+    c = daemon.containers["asker"]
+    c.server = await daemon._serve_container(c)
+
+    asking = asyncio.ensure_future(
+        request(c.paths.socket, "ask", {"question": "may I push?"})
+    )
+    await asyncio.sleep(0.05)
+
+    inbox = daemon.overview()["operator_inbox"]
+    question = [m for m in inbox if m["kind"] == "question"][-1]
+    assert "decision" not in question["payload"], "not answered yet"
+
+    daemon.resolve_approval(daemon.pending_approvals()[0]["id"], "deny", "not yet")
+    await asyncio.wait_for(asking, timeout=5)
+
+    assert not daemon.pending_approvals(), "the queue must be empty"
+    replayed = [m for m in daemon.overview()["operator_inbox"]
+                if m["kind"] == "question"][-1]
+    assert replayed["payload"]["decision"] == "deny"
+    assert replayed["payload"]["reason"] == "not yet"

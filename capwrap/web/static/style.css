@@ -390,3 +390,12 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .node .dismiss:focus-visible { opacity: 1; }
 .node .dismiss:hover { color: var(--danger); }
 h2 #dismiss-finished { margin-left: auto; text-transform: none; letter-spacing: 0; }
+
+/* An answered question stays in the inbox as history, but must not read as
+   something still waiting on you. */
+.message.answered { opacity: .55; border-left-color: var(--text-dim); }
+
+/* The terminal panel owns its own scrolling: xterm puts the scrollbar on
+   .xterm-viewport, and if this container is allowed to grow instead, the
+   content overflows silently and the wheel does nothing. */
+.terminal-host { overflow: hidden; }

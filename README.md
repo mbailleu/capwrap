@@ -609,6 +609,30 @@ or focus it and use the arrow keys (Shift for bigger steps). Widths persist in
 end. Only viewports under 720px drop a column, and it is the container list —
 never the inbox, which is where approvals arrive.
 
+## Networking
+
+`sandbox.network` is all-or-nothing today. `false` (the default) unshares the
+network namespace, leaving the container with no connectivity at all. `true`
+does **not** create a filtered network — it simply omits `--unshare-net`, so the
+container **shares the host's network namespace**.
+
+That has a consequence worth stating plainly: `127.0.0.1` inside such a
+container *is* the host's loopback, so a networked agent can reach the web
+console — which has no authentication — and grant itself capabilities:
+
+```
+$ curl -X POST http://127.0.0.1:8420/api/caps/grant -d '{"holder":"me", ...}'
+{"slot":4,"rights":["inspect","kill","send","write_input"]}
+```
+
+Verified: an agent holding no capability on a peer granted itself one this way
+and typed into that peer's terminal. **`network = true` currently defeats the
+capability model.** Until that is closed, treat a networked container as fully
+trusted, or keep the console on a socket the containers cannot reach.
+
+Per-host or per-name filtering is not implemented. See `docs/networking.md` for
+what it would take.
+
 ## Reaching the console from another machine
 
 `capwrap up` binds `127.0.0.1:8420` by default. `--host` changes that:

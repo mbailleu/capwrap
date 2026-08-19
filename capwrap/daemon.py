@@ -126,6 +126,10 @@ class Daemon:
         self.mailboxes = MailboxRegistry()
         self.containers: dict[str, Container] = {}
         self.approvals: dict[int, PendingApproval] = {}
+        #: Operator-inbox entries for questions, so a resolved one can be marked.
+        #: The inbox is history and survives a reload; without this an answered
+        #: question comes back looking like an open one.
+        self._question_messages: dict[int, Any] = {}
         self._events: list[asyncio.Queue] = []
         self._overlay_backend: str | None = None
         self._bwrap: str | None = None
@@ -638,7 +642,7 @@ class Daemon:
         self.kernel.audit.record(
             container, "ask", allowed=True, target=OPERATOR, detail=question[:200]
         )
-        self.mailboxes.get(OPERATOR).post({
+        self._question_messages[pending.id] = self.mailboxes.get(OPERATOR).post({
             "from": container, "kind": "question",
             "payload": {"id": pending.id, "question": question, "context": context},
         })
@@ -753,6 +757,14 @@ class Daemon:
         pending.future.set_result(
             {"decision": decision, "reason": reason, "rights": rights}
         )
+
+        # Record the outcome on the inbox entry. That list is replayed verbatim
+        # when the page reloads, so an answered question would otherwise come
+        # back indistinguishable from one still waiting.
+        message = self._question_messages.pop(approval_id, None)
+        if message is not None and isinstance(message.payload, dict):
+            message.payload["decision"] = decision
+            message.payload["reason"] = reason
         self.kernel.audit.record(
             OPERATOR, "approval.resolve", allowed=(decision == "allow"),
             target=pending.container, detail={"decision": decision, "reason": reason},

@@ -572,6 +572,20 @@ function renderMessages() {
     return;
   }
   host.innerHTML = state.messages.slice(-40).reverse().map((m) => {
+    // A question carries its outcome once answered. The inbox is replayed on
+    // reload, so without showing that, a decided request looks open again.
+    if (m.kind === 'question' && m.payload && typeof m.payload === 'object') {
+      const decided = m.payload.decision;
+      const mark = decided
+        ? `<span class="pill ${decided === 'allow' ? 'pill-ok' : 'pill-bad'}">${escapeHtml(decided)}</span>`
+        : '<span class="pill pill-warn">waiting</span>';
+      return `
+        <div class="message${decided ? ' answered' : ''}">
+          <div class="from">${escapeHtml(m.from)} asked ${mark}</div>
+          <div>${escapeHtml(m.payload.question || '')}</div>
+          ${m.payload.reason ? `<div class="muted small">${escapeHtml(m.payload.reason)}</div>` : ''}
+        </div>`;
+    }
     const body = typeof m.payload === 'string'
       ? m.payload : JSON.stringify(m.payload);
     return `
