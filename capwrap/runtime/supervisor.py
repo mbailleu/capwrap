@@ -27,6 +27,7 @@ import fcntl
 import os
 import pty
 import signal
+import re
 import struct
 import termios
 import time
@@ -35,6 +36,10 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import pyte
+
+#: `ESC [ ? <params> h|l` -- the private modes a TUI switches on at startup:
+#: alternate screen, mouse reporting, bracketed paste, focus tracking.
+_PRIVATE_MODE = re.compile(rb"\x1b\[\?([0-9;]+)([hl])")
 
 #: Raw output kept per container, for replay on connect.  64 KiB is enough for
 #: a few screens of scrollback without letting a chatty agent eat the heap.
@@ -72,6 +77,24 @@ class ScreenSnapshot:
         }
 
 
+_FG = {"black": 30, "red": 31, "green": 32, "brown": 33, "yellow": 33,
+       "blue": 34, "magenta": 35, "cyan": 36, "white": 37}
+
+
+def _sgr(run: dict) -> bytes:
+    """Minimal SGR for one styled run: enough to keep a repaint recognisable."""
+    codes = []
+    if run.get("o"):
+        codes.append(1)
+    if run.get("r"):
+        codes.append(7)
+    if (fg := run.get("f")) in _FG:
+        codes.append(_FG[fg])
+    if (bg := run.get("b")) in _FG:
+        codes.append(_FG[bg] + 10)
+    return b"\x1b[%sm" % b";".join(b"%d" % c for c in codes) if codes else b""
+
+
 @dataclass
 class PtySession:
     """One sandboxed process, its terminal, and everyone watching it."""
@@ -92,6 +115,7 @@ class PtySession:
     _buffered_bytes: int = field(default=0, init=False)
     _subscribers: list[Callable[[bytes], None]] = field(default_factory=list, init=False)
     _exit_waiters: list[asyncio.Future] = field(default_factory=list, init=False)
+    _modes: dict[int, bool] = field(default_factory=dict, init=False)
     _screen: pyte.Screen | None = field(default=None, init=False)
     _stream: pyte.Stream | None = field(default=None, init=False)
     _loop: asyncio.AbstractEventLoop | None = field(default=None, init=False)
@@ -141,6 +165,7 @@ class PtySession:
         self._record(data)
 
     def _record(self, data: bytes) -> None:
+        self._track_modes(data)
         self._buffer.append(data)
         self._buffered_bytes += len(data)
         while self._buffered_bytes > SCROLLBACK_BYTES and len(self._buffer) > 1:
@@ -157,6 +182,53 @@ class PtySession:
                 callback(data)
             except Exception:  # noqa: BLE001 - a dead websocket must not stop capture
                 pass
+
+    def _track_modes(self, data: bytes) -> None:
+        """Remember which private modes the program has turned on.
+
+        A late-connecting browser replays the byte ring buffer, but a long-lived
+        agent will have pushed its startup sequences out of it. Without these,
+        xterm is left in the normal buffer replaying output that assumes the
+        alternate screen -- which is why a Claude session reconnected from the
+        overview looked scrambled and would not scroll.
+        """
+        for params, action in _PRIVATE_MODE.findall(data):
+            on = action == b"h"
+            for part in params.split(b";"):
+                if part.isdigit():
+                    self._modes[int(part)] = on
+
+    def mode_preamble(self) -> bytes:
+        """Sequences that put a fresh terminal back into the program's modes."""
+        return b"".join(
+            b"\x1b[?%dh" % mode for mode, on in sorted(self._modes.items()) if on
+        )
+
+    @property
+    def alternate_screen(self) -> bool:
+        """True when the program owns the whole screen.
+
+        There is no scrollback in that mode, by design -- the buffer *is* the
+        screen -- so replaying old bytes is noise rather than history.
+        """
+        return self._modes.get(1049, False) or self._modes.get(47, False)
+
+    def repaint(self) -> bytes:
+        """The current screen as ANSI, for a client joining an alt-screen program.
+
+        A full-screen TUI redraws only when something changes, so a reconnecting
+        browser would otherwise stare at a blank or half-painted screen until the
+        agent next did something.
+        """
+        snap = self.snapshot()
+        out = [b"\x1b[H\x1b[2J"]
+        for y, runs in enumerate(snap.styled):
+            out.append(b"\x1b[%d;1H" % (y + 1))
+            for run in runs:
+                out.append(_sgr(run) + run["t"].encode("utf-8", "replace") + b"\x1b[0m")
+        x, y = snap.cursor
+        out.append(b"\x1b[%d;%dH" % (y + 1, x + 1))
+        return b"".join(out)
 
     def _on_eof(self) -> None:
         if self.master_fd is not None and self._loop is not None:

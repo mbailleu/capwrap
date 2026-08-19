@@ -334,7 +334,15 @@ def create_app(daemon: Daemon) -> FastAPI:
 
         pump_task = loop.create_task(pump())
         try:
-            if scrollback := session.scrollback():
+            # Put the terminal back into the modes the program is using before
+            # sending anything, or xterm renders alt-screen output in the normal
+            # buffer. For a full-screen program, repaint the current screen
+            # rather than replaying redraws it has long since superseded.
+            if preamble := session.mode_preamble():
+                await socket.send_bytes(preamble)
+            if session.alternate_screen:
+                await socket.send_bytes(session.repaint())
+            elif scrollback := session.scrollback():
                 await socket.send_bytes(scrollback)
 
             while True:

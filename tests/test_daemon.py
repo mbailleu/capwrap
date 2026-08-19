@@ -1161,3 +1161,47 @@ async def test_an_answered_question_is_not_replayed_as_open(daemon, tmp_path):
                 if m["kind"] == "question"][-1]
     assert replayed["payload"]["decision"] == "deny"
     assert replayed["payload"]["reason"] == "not yet"
+
+
+# ==========================================================================
+# reconnecting to a full-screen TUI
+# ==========================================================================
+
+
+@pytest.mark.sandbox
+async def test_reconnecting_restores_the_programs_terminal_modes(
+    daemon, tmp_path, require_sandbox
+):
+    """A long-lived TUI's startup sequences fall out of the ring buffer.
+
+    Claude Code enters the alternate screen and turns on mouse reporting when it
+    starts. Replaying only the tail leaves the browser in the normal buffer
+    rendering alt-screen output, which is what made a session opened from the
+    overview look scrambled and refuse to scroll.
+    """
+    daemon.register(config(
+        "tui", tmp_path,
+        runtime={"command": ["/bin/bash", "-c",
+                             # enter alt screen + mouse reporting, then emit
+                             # more than the ring buffer holds
+                             "printf '\\033[?1049h\\033[?1000h\\033[?1006h'; "
+                             "head -c 200000 /dev/zero | tr '\\0' 'x'; "
+                             "printf '\\033[H\\033[2Jready'; sleep 20"]},
+    ))
+    container = await daemon.start("tui")
+    await asyncio.sleep(2.5)
+    session = container.session
+
+    assert session.alternate_screen, "the program owns the screen"
+
+    # The enables are long gone from the raw buffer...
+    assert b"\x1b[?1049h" not in session.scrollback()
+    # ...but the daemon still knows about them.
+    preamble = session.mode_preamble()
+    for mode in (b"?1049h", b"?1000h", b"?1006h"):
+        assert mode in preamble, preamble
+
+    # And a joining client gets the current screen rather than stale redraws.
+    painted = session.repaint()
+    assert b"ready" in painted
+    assert painted.startswith(b"\x1b[H\x1b[2J")

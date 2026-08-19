@@ -685,7 +685,7 @@ capwrap/
   ipc/             protocol · per-container socket server · mailboxes
   guest/           capctl, hook.py — the only things an agent sees
   web/             FastAPI + a vanilla-JS console, xterm.js vendored locally
-tests/            191 tests; `-m sandbox` ones need a working bwrap
+tests/            193 tests; `-m sandbox` ones need a working bwrap
 ```
 
 The split that matters: `kernel/` decides what is permitted and performs no I/O;
