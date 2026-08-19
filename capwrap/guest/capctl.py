@@ -339,7 +339,17 @@ def cmd_spawn(args):
             raw = tomllib.loads(text)
     if args.name:
         raw["name"] = args.name
-    emit(call("ctr.spawn", {"factory_slot": resolve_slot(args.factory), "config": raw}), True)
+    result = call("ctr.spawn", {"factory_slot": resolve_slot(args.factory), "config": raw})
+    if args.json:
+        emit(result, True)
+        return
+    print(f"spawned {result['spawned']} ({result['remaining_quota']} left in the factory)")
+    if result.get("slot"):
+        print(f"  you hold it in slot {result['slot']} "
+              f"as child:{result['spawned']} with {','.join(result['rights'])}")
+    else:
+        print("  note: this factory grants no rights over what it creates, so you "
+              "cannot reach it. Ask the operator with `capctl request`.")
 
 
 def cmd_map(args):

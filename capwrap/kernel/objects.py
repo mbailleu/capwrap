@@ -91,6 +91,10 @@ class FactoryObject(KernelObject):
     kind: ObjectKind = field(default="factory", init=False)
     quota_containers: int = 0
     used_containers: int = 0
+    #: What the *spawner* receives on each container it creates through this
+    #: factory. Without it a parent can create a child and then have no way to
+    #: reach it at all, which makes a supervisor agent impossible to express.
+    child_rights: Rights = Rights.NONE
 
     @property
     def remaining(self) -> int:
@@ -102,6 +106,7 @@ class FactoryObject(KernelObject):
             "quota_containers": self.quota_containers,
             "used_containers": self.used_containers,
             "remaining": self.remaining,
+            "child_rights": self.child_rights.names(),
         }
 
 

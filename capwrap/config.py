@@ -285,14 +285,25 @@ class Quota(Base):
 
 
 class FactoryCap(Base):
-    """Authority to create new containers, and how many."""
+    """Authority to create new containers, how many, and what you get over them."""
 
     rights: list[str] = Field(default_factory=lambda: ["create"])
     quota: Quota = Field(default_factory=Quota)
+    #: Rights the spawner receives on each container it creates. Defaults to the
+    #: minimum that makes a parent useful -- it can talk to its child and see
+    #: whether it is alive. Reading its screen, typing at it or killing it are
+    #: bigger grants and have to be asked for.
+    child_rights: list[str] = Field(default_factory=lambda: ["send", "inspect"])
 
     @property
     def mask(self) -> Rights:
         return parse_rights(self.rights)
+
+    @property
+    def child_mask(self) -> Rights:
+        from .kernel.rights import validate_for
+
+        return validate_for("container", parse_rights(self.child_rights))
 
 
 class CapsSpec(Base):

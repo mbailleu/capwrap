@@ -33,6 +33,7 @@ from ..errors import (
     InsufficientRights,
     NoSuchCapability,
     QuotaExceeded,
+    RightsNotMonotonic,
 )
 from .audit import AuditLog
 from .captable import Task
@@ -204,9 +205,13 @@ class CapKernel:
         self._mint_root_cap(ds)
         return ds
 
-    def create_factory(self, label: str, quota_containers: int) -> FactoryObject:
+    def create_factory(
+        self, label: str, quota_containers: int,
+        child_rights: Rights = Rights.NONE,
+    ) -> FactoryObject:
         factory = FactoryObject(
-            oid=new_oid(), label=label, quota_containers=quota_containers
+            oid=new_oid(), label=label, quota_containers=quota_containers,
+            child_rights=child_rights,
         )
         self._register(factory)
         self._mint_root_cap(factory)
@@ -298,8 +303,29 @@ class CapKernel:
                 )
 
         if caps.factory is not None:
+            quota = caps.factory.quota.containers
+            child_rights = caps.factory.child_mask
+
+            # A factory handed to a spawned child may not exceed the one it was
+            # spawned through. Without this a container with a quota of 1 could
+            # create a child with a quota of 100 and spawn through that instead,
+            # and could hand that child stronger rights over *its* children than
+            # it holds over its own -- amplification by one level of indirection.
+            granter_factory = self._factory_of(granter)
+            if granter.name != ROOT and granter_factory is not None:
+                quota = min(quota, granter_factory.remaining)
+                if child_rights not in granter_factory.child_rights:
+                    excess = Rights(
+                        child_rights.value & ~granter_factory.child_rights.value
+                    )
+                    raise RightsNotMonotonic(
+                        f"cannot give {config.name}'s factory {excess} over its "
+                        f"children: this factory only grants "
+                        f"{granter_factory.child_rights}"
+                    )
+
             factory = self.create_factory(
-                f"{config.name}-factory", caps.factory.quota.containers
+                f"{config.name}-factory", quota, child_rights
             )
             self._delegate_from_root(
                 task, factory.oid, caps.factory.mask, label="factory"
@@ -326,6 +352,14 @@ class CapKernel:
             self._delegate_from(
                 granter, task, ds.oid, ds_spec.mask, label=ds_spec.label or str(ds.path)
             )
+
+    def _factory_of(self, task: Task) -> FactoryObject | None:
+        """The factory a task holds, if any. Used to bound what it may pass on."""
+        for ref in task.slots.values():
+            obj = self.objects.get(ref.oid)
+            if isinstance(obj, FactoryObject) and Rights.CREATE in ref.rights:
+                return obj
+        return None
 
     def _root_node_for(self, oid: int) -> MapNode:
         slot = self.root.find(oid)
@@ -680,7 +714,27 @@ class CapKernel:
 
         factory.used_containers += 1
         obj = self.hooks.spawn_container(config, actor)
-        return {"spawned": obj.name, "remaining_quota": factory.remaining}
+
+        # Hand the spawner a capability on what it just created. Derived from the
+        # root cap because the child is a brand-new object nobody else holds;
+        # the ceiling is the factory's `child_rights`, which the operator set
+        # when they wrote this container's config.
+        handle = None
+        if factory.child_rights:
+            handle = self._delegate_from_root(
+                task, obj.oid, factory.child_rights, label=f"child:{obj.name}"
+            )
+            self.audit.record(
+                actor, "cap.child_handle", allowed=True, target=obj.name,
+                slot=handle, rights=str(factory.child_rights),
+            )
+
+        return {
+            "spawned": obj.name,
+            "remaining_quota": factory.remaining,
+            "slot": handle,
+            "rights": factory.child_rights.names(),
+        }
 
     # -- dataspaces ------------------------------------------------------
 
@@ -790,7 +844,10 @@ class CapKernel:
             obj = self.create_dataspace(Path(target))
             default_label = target
         elif kind == "factory":
-            obj = self.create_factory(f"{holder_name}-factory", quota)
+            obj = self.create_factory(
+                f"{holder_name}-factory", quota,
+                Rights.SEND | Rights.INSPECT,
+            )
             default_label = "factory"
         else:
             raise CapabilityError(f"cannot grant a capability of kind {kind!r}")

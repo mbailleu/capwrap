@@ -133,6 +133,22 @@ Only if you hold a `factory` capability, and only within its quota. The child
 starts with **no more authority than you have**, and only what its config asks
 for and you can actually grant.
 
+You also get a capability **on** the child, labelled `child:<name>`, so you can
+reach what you created:
+
+```
+capctl spawn factory /shared/child.json
+  spawned helper (1 left in the factory)
+  you hold it in slot 4 as child:helper with inspect,send
+
+capctl send child:helper "start with the parser tests"
+```
+
+How much you get is fixed by your factory, not by you -- `capctl caps` shows it.
+If it includes `read_output` and `write_input` you can watch and drive the child
+(see above); if it grants nothing, you cannot reach the child at all and have to
+ask the operator.
+
 ## Etiquette
 
 - Check `capctl caps` before assuming you can do something.

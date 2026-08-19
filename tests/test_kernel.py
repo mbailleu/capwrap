@@ -371,3 +371,144 @@ def test_container_tree_reflects_parentage(kernel):
     tree = kernel.container_tree()
     top = [n for n in tree if n["name"] == "root-agent"][0]
     assert [c["name"] for c in top["children"]] == ["child"]
+
+
+# ==========================================================================
+# what the parent gets back
+# ==========================================================================
+
+
+def spawning_kernel(kernel):
+    """Make ctr_spawn actually register the child, as the daemon would."""
+    class Hooks(type(kernel.hooks)):
+        def spawn_container(self, cfg, parent):
+            return kernel.register_container(cfg, parent=parent)
+
+    kernel.hooks = Hooks()
+    return kernel
+
+
+def test_a_parent_receives_a_handle_on_what_it_creates(kernel):
+    """Otherwise it can spawn a child and then never reach it again.
+
+    Nothing else grants this: the child gets a `parent` capability pointing
+    back, but the relationship was one-directional until the factory started
+    handing the spawner a handle too.
+    """
+    spawning_kernel(kernel)
+    kernel.register_container(config(
+        "boss", factory={"rights": ["create"], "quota": {"containers": 2}},
+    ))
+    slot = slot_labelled(kernel, "boss", "factory")
+
+    result = kernel.ctr_spawn("boss", slot, config("kid"))
+
+    assert result["slot"] is not None
+    handle = [c for c in kernel.cap_list("boss") if c.label == "child:kid"]
+    assert handle, "the parent got no capability on its own child"
+    assert sorted(handle[0].rights) == ["inspect", "send"], "the documented default"
+
+    # And it works: the parent can message the child it just made.
+    kernel.msg_send("boss", handle[0].slot, "get started")
+
+
+def test_child_rights_are_configurable(kernel):
+    spawning_kernel(kernel)
+    kernel.register_container(config(
+        "boss",
+        factory={
+            "rights": ["create"], "quota": {"containers": 2},
+            "child_rights": ["send", "inspect", "read_output", "write_input"],
+        },
+    ))
+    slot = slot_labelled(kernel, "boss", "factory")
+    kernel.ctr_spawn("boss", slot, config("kid"))
+
+    handle = [c for c in kernel.cap_list("boss") if c.label == "child:kid"][0]
+    assert sorted(handle.rights) == [
+        "inspect", "read_output", "send", "write_input",
+    ], "a supervisor needs to read and drive, and now can be given that"
+
+
+def test_no_child_rights_means_no_handle(kernel):
+    """Still expressible: a factory that creates containers it cannot touch."""
+    spawning_kernel(kernel)
+    kernel.register_container(config(
+        "boss",
+        factory={"rights": ["create"], "quota": {"containers": 1},
+                 "child_rights": []},
+    ))
+    slot = slot_labelled(kernel, "boss", "factory")
+    result = kernel.ctr_spawn("boss", slot, config("kid"))
+
+    assert result["slot"] is None
+    assert not any(c.label.startswith("child:") for c in kernel.cap_list("boss"))
+
+
+def test_each_child_gets_its_own_labelled_slot(kernel):
+    spawning_kernel(kernel)
+    kernel.register_container(config(
+        "boss", factory={"rights": ["create"], "quota": {"containers": 3}},
+    ))
+    slot = slot_labelled(kernel, "boss", "factory")
+    kernel.ctr_spawn("boss", slot, config("first"))
+    kernel.ctr_spawn("boss", slot, config("second"))
+
+    labels = {c.label for c in kernel.cap_list("boss")}
+    assert {"child:first", "child:second"} <= labels
+
+
+# ==========================================================================
+# a factory may not be amplified through a child
+# ==========================================================================
+
+
+def test_a_spawned_factory_cannot_exceed_its_parents_quota(kernel):
+    """One level of indirection must not multiply the allowance.
+
+    A container with a quota of 1 could otherwise create a child with a quota of
+    100 and spawn through that instead.
+    """
+    spawning_kernel(kernel)
+    kernel.register_container(config(
+        "boss", factory={"rights": ["create"], "quota": {"containers": 1}},
+    ))
+    slot = slot_labelled(kernel, "boss", "factory")
+
+    kernel.ctr_spawn("boss", slot, config(
+        "kid", factory={"rights": ["create"], "quota": {"containers": 100}},
+    ))
+
+    kid_factory = [c for c in kernel.cap_list("kid") if c.kind == "factory"][0]
+    assert kid_factory.detail["quota_containers"] <= 1
+    # boss spent its only allowance creating kid, so kid inherits nothing.
+    assert kid_factory.detail["remaining"] == 0
+
+
+def test_a_spawned_factory_cannot_exceed_its_parents_child_rights(kernel):
+    """Nor may it grant stronger authority over grandchildren than it holds."""
+    spawning_kernel(kernel)
+    kernel.register_container(config(
+        "boss",
+        factory={"rights": ["create"], "quota": {"containers": 3},
+                 "child_rights": ["send", "inspect"]},
+    ))
+    slot = slot_labelled(kernel, "boss", "factory")
+
+    with pytest.raises(RightsNotMonotonic, match="kill"):
+        kernel.ctr_spawn("boss", slot, config(
+            "kid",
+            factory={"rights": ["create"], "quota": {"containers": 1},
+                     "child_rights": ["send", "inspect", "kill"]},
+        ))
+
+
+def test_an_operator_launched_container_is_not_clamped(kernel):
+    """The operator's own configs set the ceiling; they are not below one."""
+    kernel.register_container(config(
+        "top", factory={"rights": ["create"], "quota": {"containers": 50},
+                        "child_rights": ["send", "inspect", "kill"]},
+    ))
+    factory = [c for c in kernel.cap_list("top") if c.kind == "factory"][0]
+    assert factory.detail["quota_containers"] == 50
+    assert "kill" in factory.detail["child_rights"]

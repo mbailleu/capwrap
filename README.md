@@ -424,6 +424,58 @@ curl -X POST localhost:8420/api/caps/grant -H 'Content-Type: application/json' \
 A second grant on the same container gets a distinct label (`peer:dev-b#2`), so
 `capctl kill peer:dev-b#2` stays unambiguous.
 
+## What a parent gets from its children
+
+Spawning is one-directional by default: the child receives a `parent` capability
+pointing back, and that used to be all — the parent got **nothing** on the child
+it had just created, so a supervisor agent could not message, watch or stop its
+own children without asking you for a capability first.
+
+A factory now says what the spawner receives:
+
+```toml
+[caps.factory]
+rights       = ["create"]
+quota        = { containers = 3 }
+child_rights = ["send", "inspect", "read_output", "write_input"]
+```
+
+Each spawn hands the parent a slot labelled `child:<name>`:
+
+```
+$ capctl spawn factory /shared/child.json
+spawned helper (2 left in the factory)
+  you hold it in slot 4 as child:helper with inspect,read_output,send,write_input
+
+$ capctl send   child:helper "start with the parser tests"
+$ capctl screen child:helper
+$ capctl keys   child:helper down enter
+```
+
+The default is `["send", "inspect"]` — enough to talk to a child and see whether
+it is alive. Reading its screen, typing at it and killing it are larger grants
+and have to be named. `child_rights = []` restores the old behaviour: a factory
+that creates containers its owner cannot reach.
+
+The ceiling is set by whoever wrote the parent's config, not by the parent.
+
+### Factories cannot be amplified through a child
+
+A container with a quota of 1 could otherwise create a child with a quota of 100
+and spawn through that instead — the allowance multiplied by one level of
+indirection. A spawned factory is now clamped to its parent's **remaining**
+quota, and may not grant stronger `child_rights` over grandchildren than the
+factory it came from:
+
+```
+cannot give kid's factory kill over its children: this factory only grants
+inspect|send
+```
+
+Note the consequence: a parent with a quota of 1 that spends it creating a child
+leaves that child a quota of 0. Give the parent a larger allowance if you want it
+to delegate spawning.
+
 ## One agent driving another
 
 A container holding `read_output` on a peer can read its terminal; with
@@ -609,7 +661,7 @@ capwrap/
   ipc/             protocol · per-container socket server · mailboxes
   guest/           capctl, hook.py — the only things an agent sees
   web/             FastAPI + a vanilla-JS console, xterm.js vendored locally
-tests/            184 tests; `-m sandbox` ones need a working bwrap
+tests/            191 tests; `-m sandbox` ones need a working bwrap
 ```
 
 The split that matters: `kernel/` decides what is permitted and performs no I/O;
