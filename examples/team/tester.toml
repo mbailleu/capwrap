@@ -1,0 +1,75 @@
+# tester: Write and run tests. Report what actually fails.
+#
+# Prompts reach this container three ways, all visible below:
+#   1. prompts/house.md + prompts/tester.md are bound in as files
+#   2. --append-system-prompt-file points Claude at the role prompt
+#   3. CLAUDE.md in the worktree is picked up as project memory
+#
+#   capwrap up examples/team/*.toml
+
+name = "tester"
+
+[runtime]
+command = [
+  "/opt/claude/claude",
+  # The role is a *system* prompt, not a message: it survives compaction and
+  # the agent cannot talk itself out of it mid-session.
+  "--append-system-prompt-file", "/prompts/tester.md",
+]
+cwd       = "/work"
+tty       = true
+approvals = "capwrap"
+
+auto_allow = ["Read", "Glob", "Grep", "TodoWrite"]
+auto_deny  = ["Bash(sudo *)"]
+
+env_from_host = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"]
+
+# Claude's own permission rules. A reviewer that *cannot* write is a stronger
+# claim than one merely told not to.
+[runtime.permissions]
+allow = ["Read", "Glob", "Grep", "Write", "Edit", "TodoWrite", "Bash(git *)", "Bash(pytest*)", "Bash(python -m pytest*)"]
+ask   = ["WebFetch"]
+deny  = ["Bash(sudo *)", "Bash(git push*)"]
+
+[sandbox]
+network  = true
+hostname = "tester"
+unshare  = ["pid", "ipc", "uts", "cgroup"]
+
+[[mounts]]
+src  = "~/.local/bin/claude"
+dest = "/opt/claude/claude"
+mode = "ro"
+
+[[mounts]]
+src  = "~/.claude"
+dest = "/home/agent/.claude"
+mode = "copy"
+
+# The prompts directory, shared by every role and read-only to all of them.
+[[mounts]]
+src  = "prompts"
+dest = "/prompts"
+mode = "ro"
+
+[[mounts]]
+src        = "~/capwrap-demo/repo"
+dest       = "/work"
+mode       = "worktree"
+branch     = "capwrap/tester"
+base       = "main"
+on_destroy = "keep"
+
+[[files]]
+# Project memory: Claude reads this from the working directory on its own.
+dest = "/work/CLAUDE.md"
+src  = "prompts/house.md"
+
+[caps]
+parent = ["send"]
+peers = [
+  { container = "orchestrator", rights = ["send", "inspect"] },
+  { container = "programmer", rights = ["send", "inspect"] },
+  { container = "reviewer", rights = ["send", "inspect"] },
+]

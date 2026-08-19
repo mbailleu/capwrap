@@ -363,6 +363,34 @@ inherited by the agent, which puts it in `environ` where it belongs. A test
 asserts that no environment value ever appears in argv, and
 `capwrap run --dry-run` masks values whose names look like secrets.
 
+## Prompts, roles, and a team of agents
+
+A prompt reaches a container four ways:
+
+| where | how | survives compaction? | best for |
+|---|---|---|---|
+| system prompt | `--append-system-prompt-file /prompts/role.md` in `runtime.command` | yes | who the agent *is* |
+| project memory | a `CLAUDE.md` in the worktree, via `[[files]]` | yes, re-read | house rules |
+| injected files | `[[files]]` inline or from `src`, or a `ro` mount | it is just a file | reference material |
+| first message | `claude -p "..."` | no | the task, not the role |
+
+Put the role in the **system prompt**. A role stated in the first user message is
+one compaction away from being forgotten, and an agent can talk itself out of it.
+
+`examples/team/` is a worked seven-role setup — orchestrator, explorer,
+programmer, tester, reviewer, writer, architect — sharing one `prompts/`
+directory mounted read-only into all of them:
+
+```bash
+capwrap up examples/team/*.toml
+```
+
+The point is that the roles are **enforced, not described**. The reviewer's
+config denies `Write` and `Edit`, so it cannot edit whatever it is told; the
+explorer is read-only; only the orchestrator holds a factory, and its
+`child_rights` decide what it may do to the agents it spawns. See
+`examples/team/README.md`.
+
 ## Agents discover capctl on their own
 
 Every container gets a Claude Code skill at
