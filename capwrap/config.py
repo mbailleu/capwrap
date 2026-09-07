@@ -217,18 +217,38 @@ class RuntimeSpec(Base):
     env_from_host: list[str] = Field(default_factory=list)
     #: A KEY=VALUE file, read at launch. Same purpose, persisted outside the repo.
     env_file: Path | None = None
+    #: Path to a markdown file stating who the agent is.  Bound into the sandbox
+    #: at GUEST_ROLE_PROMPT and wired into the agent's system prompt according to
+    #: its profile: Claude and pi get a CLI flag inserted after the binary,
+    #: opencode gets an `instructions` entry in opencode.json, generic agents get
+    #: only the bound file (wire it into the command yourself).
+    role_prompt: Path | None = None
+    #: Which model the agent runs on, in the agent's own spelling
+    #: (e.g. "opencode-go/glm-5.3-flash").  Wired per profile: opencode gets a
+    #: `model` key in its (merged) opencode.json, Claude and pi get a --model
+    #: flag inserted after the binary.  Ignored by profiles without a mechanism.
+    model: str | None = None
     #: How the container is told a message arrived: written to /shared/inbox
     #: ("file"), typed into its PTY ("pty"), or not at all.
     notify: Literal["file", "pty", "none"] = "file"
 
-    #: Where the agent's permission prompts go.  "capwrap" installs a Claude
-    #: Code PreToolUse hook that diverts them to the operator's web inbox, so
-    #: several agents' prompts queue in one place instead of each blocking in
-    #: its own terminal.  "native" leaves Claude to prompt in its own TUI.
+    #: Where the agent's permission prompts go.  "capwrap" installs the agent's
+    #: approval shim (claude/opencode/pi) and diverts prompts to the operator's
+    #: web inbox, so several agents' prompts queue in one place instead of each
+    #: blocking in its own terminal.  "native" leaves the agent to prompt in its
+    #: own TUI.
     approvals: Literal["native", "capwrap"] = "native"
-    #: Install a Claude Code skill describing capctl, so an agent discovers how
-    #: to message peers and ask the operator without it being repeated in every
-    #: prompt.  Inert for agents that do not read skills.
+    #: Which agent profile governs guest-side injection (settings paths,
+    #: permission encoding, approval shim, skill location).  "opencode" is
+    #: opencode v1 (permissions and skill only -- no reliable approval hook
+    #: upstream); "opencode2" is the v2 beta binary, which adds approval
+    #: routing.  Defaults to "claude" for backward compatibility with every
+    #: config written before profiles existed.
+    agent: Literal["claude", "opencode", "opencode2", "pi", "generic"] = "claude"
+    #: Install the capctl skill for the agent, so it discovers how to message
+    #: peers and ask the operator without it being repeated in every prompt.
+    #: Landed in whichever skills directory the agent's profile reads.  Inert
+    #: for agents that do not read skills.
     capctl_skill: bool = True
     #: Tool patterns auto-decided without troubling the operator. Either a bare
     #: tool name (``"Read"``) or ``Tool(glob)`` matched against its main
@@ -437,6 +457,8 @@ class ContainerConfig(Base):
                 mount.branch = f"capwrap/{self.name}"
         if self.runtime.env_file is not None:
             self.runtime.env_file = _abs(self.runtime.env_file, base_dir)
+        if self.runtime.role_prompt is not None:
+            self.runtime.role_prompt = _abs(self.runtime.role_prompt, base_dir)
         for spec in self.files:
             if spec.src is not None:
                 spec.src = _abs(spec.src, base_dir)
@@ -464,6 +486,10 @@ class ContainerConfig(Base):
         for spec in self.files:
             if spec.src is not None and not spec.src.is_file():
                 raise ConfigError(f"file {spec.dest}: source {spec.src} is not a file")
+        if self.runtime.role_prompt is not None and not self.runtime.role_prompt.is_file():
+            raise ConfigError(
+                f"runtime.role_prompt: {self.runtime.role_prompt} is not a file"
+            )
         for ds in self.caps.dataspaces:
             if not ds.path.exists():
                 raise ConfigError(f"dataspace {ds.path} does not exist")

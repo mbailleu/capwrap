@@ -402,6 +402,8 @@ def create_app(daemon: Daemon) -> FastAPI:
         detail = None
         if container is not None:
             detail = {"config": {
+                "agent": container.config.runtime.agent,
+                "model": container.config.runtime.model,
                 "command": container.config.runtime.command,
                 "cwd": container.config.runtime.cwd,
                 "network": container.config.sandbox.network,

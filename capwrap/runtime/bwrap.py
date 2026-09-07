@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .. import agents
 from ..config import ContainerConfig
 from ..errors import SandboxError
 from ..paths import (
@@ -72,7 +73,17 @@ def build_argv(
     # See `build_env`.
     argv += ["--chdir", config.runtime.cwd]
     argv += ["--"]
-    argv += _entry_command(config)
+    command = _entry_command(config)
+    # Profile decoration: claude and pi read the bound role prompt via a CLI
+    # flag, and the runtime model rides the same slot; opencode gets the model
+    # in its merged opencode.json instead.  Flags are APPENDED, not inserted
+    # after argv[0]: pi's command is ["node", ".../cli.js"], and `node --model`
+    # dies with exit 9 (invalid node option).  Commander-style parsers accept
+    # flags after positionals, so the end is safe for every wired agent.
+    flags = agents.command_flags(agents.get_profile(config.runtime.agent), config)
+    if flags:
+        command = [*command, *flags]
+    argv += command
     return argv
 
 

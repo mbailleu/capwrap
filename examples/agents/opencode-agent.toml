@@ -1,0 +1,83 @@
+# An opencode v1 agent. Permission rules work through opencode.json, but
+# approval *routing* does not: v1's plugin hook that would intercept prompts
+# (`permission.ask`) is declared in the type system yet never invoked upstream,
+# so capwrap installs no shim for it and prompts stay in opencode's own TUI.
+#
+#   capwrap up examples/agents/opencode-agent.toml
+#
+# Want prompts in the operator's web inbox instead? Install the v2 beta and
+# switch `agent` to "opencode2" (see opencode2-agent.toml).
+
+name = "opencode-a"
+
+[runtime]
+command = ["/opt/opencode/opencode"]
+cwd     = "/work"
+tty     = true
+notify  = "file"
+model   = "opencode-go/glm-5.3-flash"
+
+# The opencode-go provider authenticates via this host env var.
+env_from_host = ["OPENCODE_API_KEY"]
+
+# No shim exists for v1, so prompts stay in opencode's own TUI.
+approvals = "native"
+
+agent = "opencode"
+
+# Native permission rules, encoded into opencode.json's `permission` block.
+# Tool names are lowercased for opencode; patterned rules become nested
+# `{tool: {pattern: effect}}` entries, and deny is emitted last so it wins.
+[runtime.permissions]
+allow = ["read", "glob", "grep", "bash(git status*)", "bash(git diff*)"]
+ask   = ["write", "edit"]
+deny  = ["bash(sudo *)", "bash(curl *)"]
+
+[sandbox]
+base     = "host-ro"
+network  = true          # models.dev + your provider endpoints
+hostname = "opencode-a"
+unshare  = ["pid", "ipc", "uts", "cgroup"]
+
+# The opencode install dir, mounted read-only (the binaries are wrapper
+# scripts that resolve their siblings relative to their own path, so the
+# whole dir must be mounted, not individual files).
+[[mounts]]
+src  = "~/.opencode/bin"
+dest = "/opt/opencode"
+mode = "ro"
+
+# opencode's own config: models, providers, and any permission rules you keep
+# there. A private copy, NOT a read-only bind: the capctl skill must be bound at
+# skills/capwrap/SKILL.md *inside* the config dir, and bwrap cannot create that
+# parent directory when the mount is ro (it errors with "Can't mkdir parents").
+# With copy, injected files nest fine and the agent still can't edit the rules
+# -- capwrap's injected opencode.json is bound over this and wins.
+[[mounts]]
+src  = "~/.config/opencode"
+dest = "/home/agent/.config/opencode"
+mode = "copy"
+
+# Credentials: opencode keeps logged-in sessions in auth.json. Read-only, so the
+# agent can use them but not modify them.
+[[mounts]]
+src  = "~/.local/share/opencode/auth.json"
+dest = "/home/agent/.local/share/opencode/auth.json"
+mode = "ro"
+
+[[mounts]]
+src        = "~/capwrap-demo/repo"
+dest       = "/work"
+mode       = "worktree"
+share      = "objects"
+branch     = "capwrap/opencode-a"
+base       = "main"
+on_destroy = "keep"
+
+[[mounts]]
+dest = "/scratch"
+mode = "tmpfs"
+size = "256m"
+
+[caps]
+parent = ["send"]

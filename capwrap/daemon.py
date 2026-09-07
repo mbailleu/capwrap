@@ -665,7 +665,7 @@ class Daemon:
     async def _check_permission_escalation(
         self, actor: str, config: ContainerConfig
     ) -> None:
-        """Stop a container handing its child broader Claude permissions than it has.
+        """Stop a container handing its child broader native permissions than it has.
 
         Spawning is governed by a factory capability, but that says nothing about
         the *tool permissions* inside the child. Without this check, a container

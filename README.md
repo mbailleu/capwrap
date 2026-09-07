@@ -46,6 +46,23 @@ git -C ~/capwrap-demo/repo branch           # capwrap/dev-a, capwrap/dev-b, main
 
 ---
 
+### Upgrading from a claude-only capwrap
+
+Three behavior changes an existing user can actually trip on:
+
+1. **A mounted `~/.claude` now merges.** capwrap's injection used to shadow
+   your own `settings.json`; it now reads it and merges — your `env` block
+   (a gateway `ANTHROPIC_BASE_URL`, for instance) and model preferences take
+   effect inside the container, where before they were silently dropped.
+   capwrap's `hooks` and `permissions` still win. A settings file that cannot
+   be parsed is now a launch error instead of a silent shadow.
+2. **opencode containers fail closed on daemon loss.** With only
+   `auto_allow`/`auto_deny` configured, a daemon outage degrades the container
+   to its auto-allow surface (reads work, everything needing a human is
+   refused) until the daemon returns — see "Fail-open vs fail-closed" below.
+3. **`capctl send` dropped its `kind` positional** — `capctl send 4 "msg"`
+   not `capctl send 4 note "msg"`.
+
 ## Host setup
 
 capwrap needs `bubblewrap`. Via nix:
@@ -333,6 +350,183 @@ Write: /work/hello.txt
 replies `DONE`. **Deny** → the file is never created and Claude tells you it was
 blocked. Either way the decision is in the audit log next to the request.
 
+### Agents
+
+`[runtime] agent` picks which agent's guest-side layout capwrap writes into. It
+defaults to `"claude"`, so every config written before profiles existed keeps
+working unchanged. The five profiles:
+
+| agent | settings injection | permission encoding | approval shim | skill |
+|---|---|---|---|---|
+| `claude` | `~/.claude/settings.json` | `permissions` block | `PreToolUse` hook | `~/.claude/skills/capwrap/SKILL.md` |
+| `opencode` (v1) | `~/.config/opencode/opencode.json` | `permission` block | none | `~/.config/opencode/skills/capwrap/SKILL.md` |
+| `opencode2` (v2 beta) | `~/.config/opencode2/opencode.json` | `permission` block | `permission.evaluate` plugin | `~/.config/opencode2/skills/capwrap/SKILL.md` |
+| `pi` | none | none | extension gate | `~/.pi/agent/skills/capwrap/SKILL.md` |
+| `generic` | none | none | none | none |
+
+The columns are the three ways capwrap reaches into an agent, plus the skill.
+**Settings injection** is where native permission rules land when
+`approvals = "native"`. **Permission encoding** is the translation from
+capwrap's normalized policy into that agent's native shape — `to_settings` for
+Claude, `to_opencode` for opencode (tool names lowercased, patterned rules
+nested, deny emitted last so it wins). **Approval shim** is what gets installed
+when `approvals = "capwrap"`: every shim speaks the same guest→daemon protocol
+over the socket bwrap already mounts, so prompts from every agent queue in one
+inbox. **Skill** is the capctl skill, so an agent discovers how to message peers
+and ask the operator without it being repeated in every prompt.
+
+**Role prompts.** `[runtime] role_prompt` names a markdown file stating who the
+agent is. capwrap binds it at `/run/capwrap-role.md` and wires it into the
+system prompt per profile: Claude and pi get a CLI flag inserted right after the
+binary (`--append-system-prompt-file` / `--append-system-prompt`), opencode gets
+an `instructions` entry in opencode.json, and generic agents get only the bound
+file — no flag exists to insert, so wire it into the command yourself. pi reads
+the flag's path at launch and would treat a missing file as literal text; the
+flag is only emitted because the staged-files mechanism guarantees the bind
+exists before exec. opencode has no system-prompt CLI flag at all — its
+`instructions` entry is append-grade and survives compaction, and it resolves on
+v2-beta through the v1-compat path even though the v2 docs claim it is unwired.
+
+**Model pinning, and merging with the user's config.** `[runtime] model` selects
+the model, and it rides the profile: a CLI flag for claude and pi; for opencode,
+both the legacy top-level `model` key and a per-agent pin (`agent.build.model`),
+because v2's built-in agents ignore the legacy key. When a mount covers the
+settings file, capwrap does not replace the user's config — it reads the host
+original and merges capwrap's keys on top: `permission` and `model` replace
+outright (operator policy wins), `instructions` appends, the `agent` block
+merges per agent so the user's own agent definitions survive, and for claude
+everything else in `settings.json` — an env block routing claude through a
+local gateway, for instance — is carried through. A user file that cannot be
+parsed even after JSONC comments and trailing commas are stripped is a config
+error at launch, never silently shadowed: shadowing would delete every
+provider, MCP server and agent the user configured.
+
+**opencode v1 vs v2.** The two opencode profiles encode permissions identically
+but read different config directories: v1 reads `~/.config/opencode/`, v2 reads
+`~/.config/opencode2/` (confirmed via `opencode2 debug config` — v2 never looks
+at v1's dir, which is why each profile stages its own paths). They differ in the
+approval shim. v1's
+plugin hook that would intercept prompts (`permission.ask`) is declared in the
+type system but never invoked upstream, so claiming support would silently leave
+prompts in the agent's own TUI — the v1 profile installs no shim at all, and
+`approvals = "capwrap"` is a config error. v2 (the beta, installed as
+`opencode2`) wires `permission.evaluate`, which runs for every tool call and
+blocks until it resolves, so prompts route to the operator's inbox. Each
+container has its own HOME and stages only its own agent's files, so v1 and v2
+never see each other's injections. (Run both binaries in one container and v1
+will log a plugin-load error for the v2 shim on every startup — noisy, not
+fatal.) They also keep credentials differently: v1 uses
+`~/.local/share/opencode/auth.json`, v2 a SQLite database (`opencode.db`) in
+the same data dir, so their example mounts differ.
+
+**Fail-open vs fail-closed.** When the daemon is unreachable, a shim must decide
+alone, and which decision is safe depends on the container's own permission
+config: if it contains `ask` rules, the agent's own prompt will catch what the
+shim could not route, so falling through to it is safe; if it contains none, the
+agent's own default is *allow*, and falling through would silently disable
+governance. capwrap decides this once, at staging — the policy file carries a
+`fallback` field, `"ask"` or `"deny"` — and the shims obey: the opencode v2 shim
+falls through only when there is an ask floor and denies outright otherwise; the
+pi shim always denies, because pi has no native prompt at all.
+
+What that means per container, concretely: a container configured with
+`[runtime.permissions]` that includes `ask` rules has a floor — on daemon loss
+its own TUI prompts for anything the shim could not route. A container
+configured only with `auto_allow` / `auto_deny` (the common opencode shape) has
+no floor, so on daemon loss it **degrades to its auto-allow surface**: reads
+keep working, everything that would have needed a human is refused until the
+daemon is back. That is fail-closed by design — the alternative, falling
+through to an agent whose own config would allow, is the silent-governance-off
+case — but it is worth knowing before it happens. Claude's hook keeps the
+classic behavior: unreachable → `ask`, because claude always has its own
+prompt to fall back to.
+
+`pi` and `generic` have no native permission system, so `[runtime.permissions]`
+with `approvals = "native"` is a config error for them — use `auto_allow` /
+`auto_deny` with `approvals = "capwrap"` instead. Worked examples:
+`examples/agents/opencode-agent.toml`, `examples/agents/opencode2-agent.toml`
+and `examples/agents/pi-agent.toml`.
+
+### Adding a new harness
+
+Support for a new agent is one profile plus, usually, two small pieces — not a
+new set of if/elif chains. The registry lives in `capwrap/agents.py`; fsprep,
+bwrap, the daemon and the console stay agent-agnostic. In order:
+
+1. **Declare the profile** (`AgentProfile` in `capwrap/agents.py`):
+   - `settings_path` — the guest path of the agent's native settings file
+     capwrap may write into, or `None` if it has none.
+   - `permission_encoder` — the key of the function translating capwrap's
+     normalized policy into that file's native shape, or `None`.
+   - `hook_protocol` — which approval shim to stage when
+     `approvals = "capwrap"`, or `None` if the agent has no hook that can
+     block a tool call. Claiming shim support for a hook that cannot block
+     silently leaves prompts in the agent's own TUI — v1's unwired
+     `permission.ask` is the cautionary example.
+   - `skill_path` — where the agent reads skills from, so it discovers
+     capctl on its own.
+   - `explain_argv` — the host-side, non-interactive command that explains a
+     permission request with this agent's own binary and credentials
+     (`{prompt}` and `{model}` placeholders; a missing model drops the flag
+     that targeted it).
+
+2. **Write the permission encoder** (`capwrap/kernel/policy.py`) if the agent
+   has a native permission system: a pure function from the normalized policy
+   to the agent's JSON shape. Respect the agent's own resolution semantics —
+   opencode resolves overlapping patterns last-match-wins, so deny is emitted
+   last; Claude's matcher is prefix-based, so `:*` survives there while the
+   opencode encoder rewrites it to a glob. Tool names are lowercased in every
+   encoder so one policy fragment is portable across agents.
+
+3. **Write the approval shim** (`capwrap/guest/`) if the agent has a hook
+   that can block. The protocol is one JSON line over the daemon's unix
+   socket, the same for every agent:
+
+   ```
+   → {"id":1,"op":"ask","args":{"question":...,"context":{...},"block":true,"timeout":3600}}
+   ← {"ok":true,"result":{"decision":"allow"|"deny","reason":"..."}}
+   ```
+
+   The shim reads `/run/capwrap-policy.json` (bound read-only, so an agent
+   with a shell cannot widen its own auto-decisions) for `auto_allow` /
+   `auto_deny` — rules arrive pre-normalized (lowercase tool names, glob
+   patterns), so the matcher stays dumb — and on daemon-unreachable it
+   follows the file's `fallback` field: `"ask"` means the agent's own prompt
+   will catch it, `"deny"` means nothing would and the call must be blocked.
+   Choose fail-closed unless the agent has a native prompt to fall back to.
+
+4. **Wire role prompt and model** if the agent takes CLI flags
+   (`command_flags` in `capwrap/agents.py`); if it reads them from its config
+   file instead, the settings injection carries them (opencode's
+   `instructions` entry and model pin). Flags are appended at the *end* of
+   the command, never after argv[0] — `node --model` dies with exit 9.
+
+5. **Write the example TOML** (`examples/agents/<agent>-agent.toml`): the
+   binary mount (ro), the config directory mount in **copy** mode so capwrap
+   can inject into it, `env_from_host` for credentials, and network for the
+   model API. `capwrap show` validates it without starting anything.
+
+6. **Test** (`tests/test_agents.py`): profile fields, injection shape, merge
+   behavior over a user config, shim staging. The existing composition
+   matrix is the template — add the new profile to its parametrize lists.
+
+7. **Verify live**: the horizon test. Start the container, send *"Why is the
+   horizon blue? Write a short explanation to /work/horizon.md"*, approve the
+   write in the console, check the file. Every profile here was proven
+   exactly this way, and the one flow that was not (v1's approval routing)
+   is documented as a gap rather than claimed.
+
+Quirks to expect — all found the hard way, all encoded in the profiles:
+agents read their config from surprising places (v2 reads
+`~/.config/opencode2/`, not v1's dir — discover with the agent's own
+`debug config` command); credentials may live in a SQLite database rather
+than the JSON file the docs mention (v2 migrated v1's auth.json and copied
+`${...}` templates verbatim — it does not expand them); some models refuse
+to run without explicit settings (glm-5.3-flash needs a thinking level);
+first-run onboarding state lives in files the container's copy may need
+refreshed; and an agent's own TUI selections override config pins for the
+session.
+
 ## Environment variables, and endpoint credentials
 
 `[runtime.env]` sets variables inline. For anything secret, use one of the two
@@ -380,7 +574,7 @@ A prompt reaches a container four ways:
 
 | where | how | survives compaction? | best for |
 |---|---|---|---|
-| system prompt | `--append-system-prompt-file /prompts/role.md` in `runtime.command` | yes | who the agent *is* |
+| system prompt | `role_prompt = "prompts/<role>.md"` in `[runtime]` | yes | who the agent *is* |
 | project memory | a `CLAUDE.md` in the worktree, via `[[files]]` | yes, re-read | house rules |
 | injected files | `[[files]]` inline or from `src`, or a `ro` mount | it is just a file | reference material |
 | first message | `claude -p "..."` | no | the task, not the role |
@@ -388,9 +582,15 @@ A prompt reaches a container four ways:
 Put the role in the **system prompt**. A role stated in the first user message is
 one compaction away from being forgotten, and an agent can talk itself out of it.
 
+`role_prompt` names a markdown file relative to the config directory. capwrap
+binds it at `/run/capwrap-role.md` and wires it in per agent: Claude and pi get a
+CLI flag inserted right after the binary, opencode gets an `instructions` entry
+in opencode.json, and generic agents get only the bound file (wire it into the
+command yourself).
+
 `examples/team/` is a worked seven-role setup — orchestrator, explorer,
-programmer, tester, reviewer, writer, architect — sharing one `prompts/`
-directory mounted read-only into all of them:
+programmer, tester, reviewer, writer, architect — each pointing its
+`role_prompt` at one shared `prompts/` directory:
 
 ```bash
 capwrap up examples/team/*.toml
@@ -758,22 +958,24 @@ the information an operator has least use for at the moment they have to decide.
 The question is not what the command *is* but what it will *do*, and whether it
 is a reasonable thing for this agent to be asking right now.
 
-The **Explain** button on each card asks Claude exactly that, and shows the
-answer beside the request:
-
-```bash
-pip install 'capwrap[explain]'          # optional; nothing else needs it
-export ANTHROPIC_API_KEY=...            # or `ant auth login`
-```
+The **Explain** button on each card asks exactly that, and shows the answer
+beside the request. The explanation is produced by the *asking agent's own
+harness*, on the host, in non-interactive mode: a pi request is explained by
+pi, an opencode request by opencode, a claude request by claude — the binary
+and credentials the operator already has, never a new dependency and never
+another provider's account. Each profile carries its own command
+(`explain_argv` in `capwrap/agents.py`); the ones that could act are pinned
+(pi runs `--no-tools`, claude disallows the mutating tools, opencode — whose
+CLI has no tools-off flag — runs in a scratch directory with a prompt that
+demands a direct answer), and a harness without a non-interactive mode says
+so instead of reaching for some other agent's SDK.
 
 The request reaches the model fenced as data, with the container's own
-configuration for context, and the system prompt says its job is to describe and
+configuration for context, and the prompt says its job is to describe and
 flag rather than to recommend. That matters because the thing being explained was
 written by an agent that may be trying to get a dangerous action approved by
 describing it reassuringly. The answer is shown as advice about untrusted input,
 not as a verdict — it decides nothing, and the operator still clicks the button.
-
-`CAPWRAP_EXPLAIN_MODEL` overrides the model.
 
 ## The terminal console
 

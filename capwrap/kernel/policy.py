@@ -1,6 +1,10 @@
-"""Claude permission policies as a lattice, so delegation can be checked.
+"""Permission policies as a lattice, so delegation can be checked.
 
-A config can set an agent's Claude Code permissions (`allow` / `ask` / `deny`).
+The lattice is capwrap's normalized vocabulary for tool permissions; per-agent
+encoders translate it into each agent's native shape (`to_settings` for Claude
+Code, `to_opencode` for opencode).
+
+A config can set an agent's permissions (`allow` / `ask` / `deny`).
 That is useful and also the obvious escalation hole: a container that spawns a
 child could hand the child a policy far more permissive than its own, and the
 capability system would never notice, because from the kernel's point of view a
@@ -43,6 +47,21 @@ def mode_rank(mode: str | None) -> int:
     except ValueError:
         # Unknown mode: treat as maximally permissive so it cannot sneak past.
         return len(MODE_ORDER)
+
+
+def _opencode_pattern(pattern: str | None) -> str | None:
+    """A rule's pattern in opencode's glob dialect, or None for a bare rule.
+
+    Claude writes prefixes as `git log:*` ("this command plus any args");
+    opencode matches plain globs, where the colon is a literal and the rule
+    would never fire.  Rewriting the trailing ":*" to "*" keeps one policy
+    fragment alive in both dialects.
+    """
+    if pattern is None:
+        return None
+    if pattern.endswith(":*"):
+        return pattern[:-2] + "*"
+    return pattern
 
 
 @dataclass(frozen=True)
@@ -168,6 +187,50 @@ class Policy:
             block["deny"] = [str(r) for r in self.deny]
         if self.default_mode:
             block["defaultMode"] = self.default_mode
+        return block
+
+    def to_opencode(self) -> dict:
+        """The `permission` block of an opencode config.
+
+        opencode's permission object maps a tool name to either an effect
+        ("allow"/"ask"/"deny") or, for a patterned rule, a map of pattern to
+        effect.  Rules are emitted allow first, then ask, then deny last within
+        each tool, because opencode resolves overlapping patterns last-match-wins
+        and capwrap's semantics treat deny as absolute: a deny must always win
+        over an allow for the same tool.
+
+        Patterns are normalized to opencode's glob dialect: a trailing ":*"
+        (Claude's prefix convention) is rewritten to "*", so `Bash(git log:*)`
+        arrives as `git log*` and actually matches.  Tool names are lowercased
+        to opencode's convention.
+
+        `default_mode` has no opencode equivalent, so it is dropped here.
+        """
+        block: dict = {}
+        for effect, rules in (
+            ("allow", self.allow),
+            ("ask", self.ask),
+            ("deny", self.deny),
+        ):
+            for rule in rules:
+                tool = rule.tool.lower()
+                pattern = _opencode_pattern(rule.pattern)
+                if pattern is None:
+                    if isinstance(block.get(tool), dict):
+                        # A bare rule alongside patterned ones for the same
+                        # tool: promote it to the catch-all key so nothing is
+                        # lost.
+                        block[tool]["*"] = effect
+                    else:
+                        block[tool] = effect
+                else:
+                    existing = block.get(tool)
+                    if not isinstance(existing, dict):
+                        # A bare rule for this tool was emitted earlier; fold it
+                        # into the object under the catch-all key so the
+                        # patterned rule does not clobber it.
+                        block[tool] = {"*": existing} if existing is not None else {}
+                    block[tool][pattern] = effect
         return block
 
     @property

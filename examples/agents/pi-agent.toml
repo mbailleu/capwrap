@@ -1,0 +1,89 @@
+# A pi agent, with every tool call routed through the capwrap gate.
+#
+#   capwrap up examples/agents/pi-agent.toml
+#   # then open http://127.0.0.1:8420
+#
+# pi has no native permission system -- its docs say "no permission popups,
+# build your own with extensions" -- so capwrap's extension is the *only* thing
+# standing between a tool call and execution. Use auto_allow/auto_deny, not
+# [runtime.permissions]: pi has no permission encoder, and a non-empty
+# permissions block with approvals = "native" is a config error.
+#
+# The gate fails CLOSED: if the daemon is unreachable the tool call is blocked,
+# because pi has no native prompt to fall back to. Keep the daemon running.
+#
+# The extension is staged into ~/.pi/agent/extensions/capwrap-gate.ts, so that
+# directory must exist on the host (pi creates it when you install an extension).
+
+name = "pi-a"
+
+[runtime]
+# pi is a Node script; /usr/bin/node comes with the host-ro base, so mount the
+# installed package and exec it directly (the ~/.local/bin/pi symlink is just
+# a convenience wrapper that does not exist inside the sandbox).
+command = ["node", "/opt/pi/pi-agent/dist/cli.js", "--thinking", "high"]
+cwd     = "/work"
+tty     = true
+notify  = "file"
+model   = "opencode-go/glm-5.3-flash"
+
+
+# The opencode-go provider authenticates via this host env var.
+env_from_host = ["OPENCODE_API_KEY"]
+
+# The extension diverts every tool call to the operator's inbox.
+approvals = "capwrap"
+
+# Auto-decisions, matched against pi's lowercase tool names. Everything else
+# reaches the operator.
+auto_allow = [
+  "read",
+  "glob",
+  "grep",
+  "bash(git status*)",
+  "bash(git diff*)",
+  "bash(git log*)",
+]
+auto_deny = [
+  "bash(sudo *)",
+  "bash(curl *)",
+]
+
+agent = "pi"
+
+[sandbox]
+base     = "host-ro"
+network  = true          # pi needs to reach its model provider
+hostname = "pi-a"
+unshare  = ["pid", "ipc", "uts", "cgroup"]
+
+# pi's own config and credentials. A private copy, not ro: the capctl skill
+# must be bound at skills/capwrap/SKILL.md inside the dir, and bwrap cannot
+# mkdir parents in a read-only mount ("Can't mkdir parents" on startup).
+[[mounts]]
+src  = "~/.pi/agent"
+dest = "/home/agent/.pi/agent"
+mode = "copy"
+
+# The pi package (npm install), mounted read-only.
+[[mounts]]
+src  = "~/.local/lib/node_modules/@earendil-works/pi-coding-agent"
+dest = "/opt/pi/pi-agent"
+mode = "ro"
+
+[[mounts]]
+src        = "~/capwrap-demo/repo"
+dest       = "/work"
+mode       = "worktree"
+share      = "objects"
+branch     = "capwrap/pi-a"
+base       = "main"
+on_destroy = "keep"
+
+[[mounts]]
+dest = "/scratch"
+mode = "tmpfs"
+size = "256m"
+
+[caps]
+parent = ["send"]

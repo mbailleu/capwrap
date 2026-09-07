@@ -12,7 +12,6 @@ home.
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import shutil
@@ -21,13 +20,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal
 
+from .. import agents
 from ..config import ContainerConfig, FileSpec, MountSpec
 from ..errors import SandboxError
 from ..paths import (
     GUEST_GITDIR_ROOT,
     GUEST_HOME,
-    GUEST_POLICY,
-    GUEST_TOOLS,
     ContainerPaths,
     slugify,
 )
@@ -97,20 +95,15 @@ def prepare(
     if prepared.needs_git_config:
         _write_gitconfig(paths, _worktree_relative(prepared))
 
-    if config.runtime.approvals == "capwrap":
-        prepared.files.extend(_install_approval_hook(config, paths))
-    elif not config.runtime.permissions.to_policy().is_empty:
-        # Permission rules apply regardless of where prompts are routed.
-        prepared.files.append(_install_permissions_only(config, paths))
+    profile = agents.get_profile(config.runtime.agent)
+    prepared.files.extend(_stage_all(agents.guest_injections(profile, config), paths))
 
-    if config.runtime.capctl_skill:
+    if config.runtime.capctl_skill and profile.skill_path:
         skill = Path(__file__).resolve().parent.parent / "guest" / "skill" / "SKILL.md"
         if skill.is_file():
-            # Bound like the hook settings, so a config that mounts its own
-            # $HOME/.claude for credentials does not shadow it.
-            prepared.files.append(
-                (skill, f"{GUEST_HOME}/.claude/skills/capwrap/SKILL.md")
-            )
+            # Bound like the injected settings, so a config that mounts its own
+            # agent config dir for credentials does not shadow it.
+            prepared.files.append((skill, profile.skill_path))
 
     return prepared
 
@@ -130,65 +123,28 @@ def _stage(path: Path, text: str, mode: int) -> Path:
     return path
 
 
-def _install_approval_hook(
-    config: ContainerConfig, paths: ContainerPaths
+def _stage_all(
+    injections: list[agents.Injection], paths: ContainerPaths
 ) -> list[tuple[Path, str]]:
-    """Register the PreToolUse hook that diverts prompts to the operator.
+    """Stage a set of injections, returning (staged host path, guest dest) pairs.
 
-    Two files: Claude Code settings in the container's HOME wiring up the hook,
-    and a policy file listing what may be auto-decided.  The policy is bound
-    read-only so the agent cannot widen its own permissions by editing it --
-    which it would otherwise be entirely capable of doing, since it has a shell.
+    Content injections go through `_stage`; source injections are copied, since
+    they are host files (the agent's own shim code) rather than generated text.
     """
-    settings: dict = {
-        "hooks": {
-            "PreToolUse": [{
-                "matcher": "*",
-                "hooks": [{
-                    "type": "command",
-                    "command": f"{GUEST_TOOLS}/hook.py",
-                    "timeout": 3600,
-                }],
-            }],
-        },
-    }
-    permissions = config.runtime.permissions.to_policy().to_settings()
-    if permissions:
-        settings["permissions"] = permissions
-
-    settings_file = _stage(
-        paths.files / "claude-settings.json",
-        json.dumps(settings, indent=2) + "\n",
-        0o444,
-    )
-
-    policy = _stage(paths.files / "policy.json", json.dumps({
-        "allow": config.runtime.auto_allow,
-        "deny": config.runtime.auto_deny,
-    }, indent=2) + "\n", 0o444)
-    # Bound rather than written into HOME, because injected files are applied
-    # after every mount: a config that mounts its own $HOME/.claude (to bring in
-    # credentials) would otherwise shadow the hook registration and silently
-    # disable approval routing.
-    return [
-        (settings_file, f"{GUEST_HOME}/.claude/settings.json"),
-        (policy, GUEST_POLICY),
-    ]
-
-
-def _install_permissions_only(
-    config: ContainerConfig, paths: ContainerPaths
-) -> tuple[Path, str]:
-    """settings.json with permission rules but no capwrap hook."""
-    settings = _stage(
-        paths.files / "claude-settings.json",
-        json.dumps(
-            {"permissions": config.runtime.permissions.to_policy().to_settings()},
-            indent=2,
-        ) + "\n",
-        0o444,
-    )
-    return settings, f"{GUEST_HOME}/.claude/settings.json"
+    out: list[tuple[Path, str]] = []
+    for inj in injections:
+        staged = paths.files / inj.staged_name
+        if inj.content is not None:
+            _stage(staged, inj.content, inj.mode)
+        else:
+            assert inj.src is not None
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            if staged.exists():
+                staged.unlink()
+            shutil.copyfile(inj.src, staged)
+            staged.chmod(inj.mode)
+        out.append((staged, inj.dest))
+    return out
 
 
 def _worktree_relative(prepared: PreparedFs) -> list[str]:

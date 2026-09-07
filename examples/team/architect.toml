@@ -1,9 +1,10 @@
 # architect: Design decisions and their trade-offs. Advises, does not build.
 #
 # Prompts reach this container three ways, all visible below:
-#   1. prompts/house.md + prompts/architect.md are bound in as files
-#   2. --append-system-prompt-file points Claude at the role prompt
-#   3. CLAUDE.md in the worktree is picked up as project memory
+#   1. role_prompt = "prompts/architect.md" is bound at /run/capwrap-role.md
+#      and wired into the system prompt (Claude reads it via a flag capwrap inserts)
+#   2. prompts/house.md is bound in as /work/CLAUDE.md, the project memory
+#   3. the worktree is the working context
 #
 #   capwrap up examples/team/*.toml
 
@@ -12,10 +13,11 @@ name = "architect"
 [runtime]
 command = [
   "/opt/claude/claude",
-  # The role is a *system* prompt, not a message: it survives compaction and
-  # the agent cannot talk itself out of it mid-session.
-  "--append-system-prompt-file", "/prompts/architect.md",
 ]
+# The role is a *system* prompt, not a message: it survives compaction and the
+# agent cannot talk itself out of it mid-session. capwrap binds the file at
+# /run/capwrap-role.md and inserts --append-system-prompt-file after the binary.
+role_prompt = "prompts/architect.md"
 cwd       = "/work"
 tty       = true
 approvals = "capwrap"
@@ -25,10 +27,10 @@ auto_deny  = ["Bash(sudo *)"]
 
 env_from_host = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"]
 
-# Claude's own permission rules. A reviewer that *cannot* write is a stronger
-# claim than one merely told not to.
+# Claude's own permission rules. Write allowed but Edit denied: it can author
+# new decision notes but never alter an existing file. Advises, does not build.
 [runtime.permissions]
-allow = ["Read", "Glob", "Grep", "Write", "Bash(git log:*)"]
+allow = ["Read", "Glob", "Grep", "Write", "TodoWrite", "Bash(git log:*)"]
 ask   = ["WebFetch"]
 deny  = ["Edit", "Bash(sudo *)"]
 
@@ -46,12 +48,6 @@ mode = "ro"
 src  = "~/.claude"
 dest = "/home/agent/.claude"
 mode = "copy"
-
-# The prompts directory, shared by every role and read-only to all of them.
-[[mounts]]
-src  = "prompts"
-dest = "/prompts"
-mode = "ro"
 
 [[mounts]]
 src        = "~/capwrap-demo/repo"

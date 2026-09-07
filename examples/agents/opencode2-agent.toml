@@ -1,0 +1,114 @@
+# An opencode v2 (beta) agent, with its permission prompts routed to the capwrap
+# web console instead of opencode's own TUI.
+#
+#   capwrap up examples/agents/opencode2-agent.toml
+#   # then open http://127.0.0.1:8420
+#
+# v2 is the beta that actually wires opencode's `permission.evaluate` plugin
+# hook, which runs for every tool call and blocks until it resolves -- that is
+# what makes approval routing possible. v1 declares the hook but never invokes
+# it (see opencode-agent.toml). The plugin is staged into
+# ~/.config/opencode2/plugins/capwrap.ts (v2 reads its own config dir,
+# ~/.config/opencode2 -- not v1's ~/.config/opencode), so that directory
+# must exist on the host (opencode2 creates it on first run).
+#
+# Daemon-loss behavior: this container configures auto_allow/auto_deny only,
+# so its policy file carries fallback = "deny" -- if the capwrap daemon goes
+# away, the container degrades to its auto-allow surface (reads keep working,
+# anything that would have needed a human is refused) until the daemon is
+# back.  Give it [runtime.permissions] with ask rules instead if you want its
+# own TUI to prompt on daemon loss.
+#
+# Network is on because opencode needs to reach models.dev and your provider's
+# API endpoints; everything else is still confined.
+
+name = "opencode2-a"
+
+[runtime]
+# --standalone: a private server on an ephemeral port.  The default
+# background service hardcodes port 49374 for the beta channel, which
+# collides with any other v2 service on the host network.
+command = ["/opt/opencode/opencode2", "--standalone"]
+cwd     = "/work"
+tty     = true
+notify  = "file"
+model   = "opencode-go/glm-5.3-flash"
+
+# The opencode-go provider authenticates via this host env var.
+env_from_host = ["OPENCODE_API_KEY"]
+
+# v2's permission.evaluate hook blocks until the operator answers, so every
+# prompt lands in the web console's inbox.
+approvals = "capwrap"
+
+# Things not worth waking a human for. Everything else still asks. opencode
+# spells tool names lowercase, so the policy rules must too.
+auto_allow = [
+  "read",
+  "glob",
+  "grep",
+  "bash(git status*)",
+  "bash(git diff*)",
+  "bash(git log*)",
+]
+auto_deny = [
+  "bash(sudo *)",
+  "bash(curl *)",
+]
+
+# Which agent profile governs guest-side injection.
+agent = "opencode2"
+
+[sandbox]
+base     = "host-ro"
+network  = true          # models.dev + your provider endpoints
+hostname = "opencode2-a"
+unshare  = ["pid", "ipc", "uts", "cgroup"]
+
+# The opencode install dir, mounted read-only (opencode2 is a wrapper script
+# that resolves opencode2.bin relative to its own path, so the whole dir must
+# be mounted, not individual files).
+[[mounts]]
+src  = "~/.opencode/bin"
+dest = "/opt/opencode"
+mode = "ro"
+
+# A private copy, not a read-only bind: injected skill/plugins nest inside it
+# (see opencode-agent.toml for why ro breaks with "Can't mkdir parents").
+[[mounts]]
+src  = "~/.config/opencode2"
+dest = "/home/agent/.config/opencode2"
+mode = "copy"
+
+# Credentials: v2 keeps logged-in sessions in a SQLite database (opencode.db in
+# the data dir), not the auth.json file v1 uses. The whole data dir is bound
+# read-write because SQLite needs write access (WAL, token refresh); it also
+# holds session state, so the agent sees your host-side opencode history.
+[[mounts]]
+src  = "~/.local/share/opencode"
+dest = "/home/agent/.local/share/opencode"
+mode = "rw"
+
+[[mounts]]
+src        = "~/capwrap-demo/repo"
+dest       = "/work"
+mode       = "worktree"
+share      = "objects"
+branch     = "capwrap/opencode2-a"
+base       = "main"
+on_destroy = "keep"
+
+[[mounts]]
+dest = "/scratch"
+mode = "tmpfs"
+size = "256m"
+
+[caps]
+parent = ["send"]
+
+# opencode v2's background service keeps its socket + lock under
+# XDG_RUNTIME_DIR.  The sandbox gets a fresh tmpfs /run, so the host's
+# /run/user/1000 does not exist in here -- give the service its own.
+[[mounts]]
+dest = "/run/user/1000"
+mode = "tmpfs"

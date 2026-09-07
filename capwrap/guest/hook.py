@@ -73,8 +73,12 @@ def matches(rules: list[str], tool: str, command: str) -> bool:
     """A rule matches a bare tool name, or `Tool(pattern)` against its argument.
 
     ``Bash(git *)`` is the shape people actually want: allow git, keep asking
-    about everything else the same tool could do.
+    about everything else the same tool could do.  Rules arrive pre-normalised
+    from the policy file (lowercase tool names, glob patterns -- see
+    agents._normalize_rule); the tool name is lowercased here because Claude
+    capitalises its tool names ("Read") while the policy file does not.
     """
+    tool = tool.lower()
     for rule in rules:
         if rule == tool or rule == "*":
             return True

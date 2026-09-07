@@ -642,7 +642,13 @@ class CapKernel:
         if not signature:
             return ""
         author = self.find_container(actor)
-        key = author.public_key if author is not None else ""
+        if author is None:
+            # Distinct from "no key": the key is minted at registration, so a
+            # missing *object* means the container is not registered (yet or
+            # anymore) -- saying "no key" would send the operator looking in
+            # the wrong place.
+            raise CapabilityError(f"no container {actor!r} is registered")
+        key = author.public_key
         if not key:
             raise CapabilityError(f"{actor} has no signing key registered")
         if not verify_message(key, actor, payload, signature):

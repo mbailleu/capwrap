@@ -46,6 +46,10 @@ GUEST_SHARED = "/shared"
 #: Auto-approval policy inside a sandbox. On the /run tmpfs rather than under
 #: GUEST_TOOLS, because bwrap cannot bind a new file into a read-only mount.
 GUEST_POLICY = "/run/capwrap-policy.json"
+#: Where the agent's role prompt is bound inside a sandbox.  Bound via the
+#: staged-files mechanism; /run is a writable tmpfs in every sandbox, so the
+#: parent directory always exists.
+GUEST_ROLE_PROMPT = "/run/capwrap-role.md"
 #: HOME inside a sandbox.
 GUEST_HOME = "/home/agent"
 #: Where the main .git dir of a worktree's origin repo is mounted.

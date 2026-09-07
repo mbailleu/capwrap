@@ -18,7 +18,6 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio", "httpx"]
 # Only for the console's "Explain" button. capwrap runs fine without it.
-explain = ["anthropic"]
 
 [project.scripts]
 capwrap = "capwrap.cli:main"

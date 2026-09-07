@@ -18,7 +18,7 @@ Four mechanisms, three of which these configs use:
 
 | where | how | survives compaction? | best for |
 |---|---|---|---|
-| **system prompt** | `--append-system-prompt-file /prompts/<role>.md` | yes | who the agent *is* |
+| **system prompt** | `role_prompt = "prompts/<role>.md"` in `[runtime]` | yes | who the agent *is* |
 | **project memory** | a `CLAUDE.md` in the worktree | yes, re-read | house rules, conventions |
 | **injected files** | `[[files]]` / a `ro` mount | it is just a file | reference material |
 | **first message** | `claude -p "..."` in `runtime.command` | no | the task, not the role |
@@ -27,11 +27,14 @@ The role goes in the **system prompt** deliberately. A role stated in the first
 user message is one compaction away from being forgotten, and an agent can talk
 itself out of it; a system prompt is neither.
 
-`prompts/` is mounted read-only into every container at `/prompts`, so all seven
-share one copy of `house.md` — edit it once and every agent gets it.
+`role_prompt` names a markdown file relative to the config directory. capwrap
+binds it at `/run/capwrap-role.md` and wires it into the agent's system prompt
+per profile — Claude and pi get a CLI flag inserted after the binary, opencode
+gets an `instructions` entry in opencode.json, generic agents get only the bound
+file.
 
-`prompts/house.md` is *also* bound in as each worktree's `CLAUDE.md`, which
-Claude reads by itself without any flag.
+`prompts/house.md` is bound in as each worktree's `CLAUDE.md`, which Claude reads
+by itself without any flag.
 
 ## Roles are enforced, not just described
 

@@ -22,24 +22,24 @@ request, and it is shown as such. It does not decide anything, it cannot approve
 anything, and the operator still clicks the button. Anything else would put an
 LLM in the position the capability kernel exists to keep humans in.
 
-The Anthropic SDK is an optional dependency: capwrap runs perfectly well without
-this, and an operator who never presses the button should not have to install it.
+The explanation is produced by the asking agent's own harness, on the host,
+in non-interactive mode: a pi request is explained by pi, an opencode request
+by opencode, a claude request by claude -- the binary and credentials the
+operator already has, never a new dependency.  Each profile carries its own
+command (agents.explain_argv); the ones that can run tools are pinned: pi
+gets --no-tools, claude gets the mutating tools disallowed, and opencode --
+whose CLI has no tools-off flag -- runs in a scratch directory with a prompt
+that demands a direct answer.  The answer is advisory either way: it decides
+nothing, and the operator still clicks the button.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
-from typing import Any
+import subprocess
 
-#: What explains. Opus by default because the useful half of the answer is the
-#: part that notices something is off, and that is a judgement task.
-DEFAULT_MODEL = "claude-opus-5"
-
-#: Short on purpose. This is read in a sidebar, next to a button someone is
-#: waiting to press.
-MAX_TOKENS = 1024
+from . import agents
 
 SYSTEM_PROMPT = """\
 You explain pending permission requests to the human operating capwrap, a system \
@@ -78,25 +78,6 @@ capitalised words above followed by a colon.\
 
 class ExplainError(Exception):
     """The explanation could not be produced."""
-
-
-def _client():
-    """The Anthropic client, or a message saying how to get one.
-
-    Imported here rather than at module scope so that capwrap starts, and every
-    other feature works, on a host that has never installed the SDK.
-    """
-    try:
-        import anthropic
-    except ImportError:
-        raise ExplainError(
-            "explanations need the Anthropic SDK: pip install 'capwrap[explain]'"
-        ) from None
-
-    try:
-        return anthropic.Anthropic()
-    except Exception as exc:                                    # noqa: BLE001
-        raise ExplainError(f"could not build an Anthropic client: {exc}") from None
 
 
 def build_prompt(approval: dict, container: dict | None = None) -> str:
@@ -153,15 +134,15 @@ class Explainer:
     for the same question, which reads as the system being unsure.
     """
 
-    def __init__(self, model: str | None = None) -> None:
-        self.model = model or os.environ.get("CAPWRAP_EXPLAIN_MODEL", DEFAULT_MODEL)
+    def __init__(self, timeout: float = 90.0) -> None:
+        self.timeout = timeout
         self._cache: dict[int, dict] = {}
 
     def cached(self, approval_id: int) -> dict | None:
         return self._cache.get(approval_id)
 
-    def forget(self, approval_id: int) -> None:
-        self._cache.pop(approval_id, None)
+    def forget(self, approval_id: int) -> dict | None:
+        return self._cache.pop(approval_id, None)
 
     async def explain(
         self, approval: dict, container: dict | None = None
@@ -170,68 +151,54 @@ class Explainer:
         if (hit := self._cache.get(approval_id)) is not None:
             return {**hit, "cached": True}
 
+        config = (container or {}).get("config") or {}
+        profile = agents.get_profile(config.get("agent") or "claude")
+        if profile.explain_argv is None:
+            raise ExplainError(
+                f"no explainer for agent {profile.name!r}: it has no "
+                "non-interactive mode capwrap can use"
+            )
+        model = config.get("model")
         prompt = build_prompt(approval, container)
-        # The SDK is synchronous and the daemon owns one event loop that a
-        # blocked agent is waiting on; a multi-second call on it would stall
-        # every other container's terminal.
-        text = await asyncio.to_thread(self._ask, prompt)
 
-        result = {"text": text, "model": self.model, "cached": False}
-        self._cache[approval_id] = {"text": text, "model": self.model}
+        # The harness call is synchronous and the daemon owns one event loop
+        # that a blocked agent is waiting on; a multi-second call on it would
+        # stall every other container's terminal.
+        text = await asyncio.to_thread(self._ask, profile, model, prompt)
+
+        used = model or profile.name
+        result = {"text": text, "model": used, "cached": False}
+        self._cache[approval_id] = {"text": text, "model": used}
         return result
 
-    def _ask(self, prompt: str) -> str:
-        client = _client()
+    def _ask(self, profile, model: str | None, prompt: str) -> str:
+        # The system prompt rides inside the message: the harnesses disagree
+        # about system-prompt flags, and the fencing works as the first thing
+        # the model reads either way.
+        argv = agents.fill_explain_argv(
+            profile, f"{SYSTEM_PROMPT}\n\n{prompt}", model
+        )
         try:
-            response = client.messages.create(
-                model=self.model,
-                max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
-                # Low effort: this is a short read of a short request, and the
-                # operator is waiting on it with a finger over the button.
-                output_config={"effort": "low"},
-                messages=[{"role": "user", "content": prompt}],
+            run = subprocess.run(
+                argv, capture_output=True, text=True, timeout=self.timeout,
+                cwd="/tmp",  # a scratch dir: no project for a curious model to index
             )
-        except Exception as exc:                                # noqa: BLE001
-            raise ExplainError(_readable(exc)) from None
-
-        if getattr(response, "stop_reason", None) == "refusal":
-            details = getattr(response, "stop_details", None)
-            reason = getattr(details, "explanation", "") or "no explanation given"
-            raise ExplainError(f"the model declined to explain this: {reason}")
-
-        text = "".join(
-            block.text for block in response.content
-            if getattr(block, "type", None) == "text"
-        ).strip()
+        except FileNotFoundError:
+            raise ExplainError(
+                f"no explainer for {profile.name!r}: {argv[0]!r} is not "
+                "installed on this host"
+            ) from None
+        except subprocess.TimeoutExpired:
+            raise ExplainError(
+                f"the explainer timed out after {self.timeout:.0f}s"
+            ) from None
+        if run.returncode != 0:
+            detail = (run.stderr or run.stdout or "").strip().splitlines()
+            raise ExplainError(
+                f"{argv[0]} exited {run.returncode}: "
+                f"{detail[-1][:200] if detail else 'no output'}"
+            )
+        text = run.stdout.strip()
         if not text:
             raise ExplainError("the model returned nothing")
         return text
-
-
-#: Fragments that mean "no credentials", from wherever the SDK raises. Matched
-#: on the message as well as the type, because a missing key surfaces as a
-#: TypeError from the auth resolver rather than as AuthenticationError.
-_NO_CREDENTIALS = (
-    "could not resolve authentication",
-    "expected one of api_key",
-    "x-api-key",
-)
-
-
-def _readable(exc: Exception) -> str:
-    """Turn an SDK failure into something an operator can act on."""
-    name = type(exc).__name__
-    message = str(getattr(exc, "message", None) or exc)
-    lowered = message.lower()
-
-    if "Authentication" in name or any(f in lowered for f in _NO_CREDENTIALS):
-        return (
-            "no usable Anthropic credentials: set ANTHROPIC_API_KEY in the "
-            "environment capwrap runs in, or run `ant auth login`"
-        )
-    if "RateLimit" in name:
-        return "rate limited by the Anthropic API; try again shortly"
-    if "Connection" in name or "Timeout" in name:
-        return "could not reach the Anthropic API"
-    return f"{name}: {message}"[:300]

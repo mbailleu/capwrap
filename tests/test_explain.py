@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import pytest
 
+import subprocess
+
+from capwrap import agents
 from capwrap.explain import (
-    DEFAULT_MODEL,
     SYSTEM_PROMPT,
     ExplainError,
     Explainer,
-    _readable,
     build_prompt,
 )
 
@@ -119,7 +120,7 @@ async def test_an_explanation_is_produced_and_then_reused(monkeypatch):
     """
     calls: list[str] = []
 
-    def fake_ask(prompt: str) -> str:
+    def fake_ask(profile, model, prompt: str) -> str:
         calls.append(prompt)
         return "WHAT IT DOES: fetches and runs a script."
 
@@ -137,73 +138,92 @@ async def test_an_explanation_is_produced_and_then_reused(monkeypatch):
 async def test_forgetting_an_approval_drops_its_explanation(monkeypatch):
     """Approval ids are reused across a long-lived daemon's lifetime."""
     explainer = Explainer()
-    monkeypatch.setattr(explainer, "_ask", lambda _p: "first answer")
+    monkeypatch.setattr(explainer, "_ask", lambda _p, _m, _pr: "first answer")
     await explainer.explain(approval("one", tool="Bash"))
 
     explainer.forget(1)
-    monkeypatch.setattr(explainer, "_ask", lambda _p: "second answer")
+    monkeypatch.setattr(explainer, "_ask", lambda _p, _m, _pr: "second answer")
     again = await explainer.explain(approval("two", tool="Bash"))
     assert again["text"] == "second answer"
 
 
-def test_the_model_defaults_to_opus_and_can_be_overridden(monkeypatch):
-    assert Explainer().model == DEFAULT_MODEL
-    monkeypatch.setenv("CAPWRAP_EXPLAIN_MODEL", "claude-haiku-4-5")
-    assert Explainer().model == "claude-haiku-4-5"
-    assert Explainer(model="claude-sonnet-5").model == "claude-sonnet-5"
+async def test_the_explainer_dispatches_to_the_asking_agents_harness(monkeypatch):
+    """A pi request is explained by pi, with pi's model -- not by some
+    globally configured explainer."""
+    seen: dict = {}
 
-
-def test_a_refusal_is_reported_rather_than_shown_as_an_explanation(monkeypatch):
-    class Refused:
-        stop_reason = "refusal"
-
-        class stop_details:
-            explanation = "declined"
-
-        content = []
+    def fake_ask(profile, model, prompt):
+        seen["profile"] = profile.name
+        seen["model"] = model
+        return "WHAT IT DOES: writes a file."
 
     explainer = Explainer()
-    monkeypatch.setattr("capwrap.explain._client", lambda: _StubClient(Refused()))
-    with pytest.raises(ExplainError, match="declined"):
-        explainer._ask("anything")
+    monkeypatch.setattr(explainer, "_ask", fake_ask)
+    container = {"config": {"agent": "pi", "model": "opencode-go/glm-5.3-flash"}}
+    await explainer.explain(approval("Write: /work/x", tool="Write"), container)
+
+    assert seen["profile"] == "pi"
+    assert seen["model"] == "opencode-go/glm-5.3-flash"
+
+
+async def test_a_container_without_a_model_uses_the_harness_default(monkeypatch):
+    seen: dict = {}
+
+    def fake_ask(profile, model, prompt):
+        seen["model"] = model
+        return "WHAT IT DOES: nothing."
+
+    explainer = Explainer()
+    monkeypatch.setattr(explainer, "_ask", fake_ask)
+    container = {"config": {"agent": "claude"}}
+    await explainer.explain(approval("Bash: ls", tool="Bash"), container)
+    assert seen["model"] is None
+
+
+async def test_an_agent_without_an_explainer_errors_clearly():
+    """generic has no non-interactive mode; the button says so instead of
+    reaching for some other agent's SDK."""
+    explainer = Explainer()
+    container = {"config": {"agent": "generic"}}
+    with pytest.raises(ExplainError, match="no explainer"):
+        await explainer.explain(approval("Bash: ls", tool="Bash"), container)
+
+
+def test_a_missing_harness_binary_is_an_actionable_error(monkeypatch):
+    import subprocess
+    explainer = Explainer()
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()))
+    with pytest.raises(ExplainError, match="not installed"):
+        explainer._ask(agents.get_profile("pi"), None, "prompt")
+
+
+def test_a_timeout_is_reported(monkeypatch):
+    import subprocess
+    explainer = Explainer()
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("pi", 90)))
+    with pytest.raises(ExplainError, match="timed out"):
+        explainer._ask(agents.get_profile("pi"), None, "prompt")
+
+
+def test_a_nonzero_exit_surfaces_the_stderr(monkeypatch):
+    import subprocess
+    explainer = Explainer()
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Run(1, "", "boom"))
+    with pytest.raises(ExplainError, match="boom"):
+        explainer._ask(agents.get_profile("pi"), None, "prompt")
 
 
 def test_an_empty_answer_is_an_error_not_a_blank_card(monkeypatch):
     explainer = Explainer()
-    monkeypatch.setattr("capwrap.explain._client", lambda: _StubClient(FakeResponse("")))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Run(0, "", ""))
     with pytest.raises(ExplainError, match="returned nothing"):
-        explainer._ask("anything")
+        explainer._ask(agents.get_profile("pi"), None, "prompt")
 
 
-@pytest.mark.parametrize("message,expected", [
-    ("Could not resolve authentication method. Expected one of api_key", "credentials"),
-    ("Expected one of api_key, auth_token", "credentials"),
-], ids=["auth-resolver", "api-key-hint"])
-def test_a_missing_key_says_what_to_set(message, expected):
-    """The failure every operator without a key hits, so it has to be actionable."""
-    assert expected in _readable(TypeError(message))
-    assert "ANTHROPIC_API_KEY" in _readable(TypeError(message))
-
-
-def test_other_failures_keep_their_shape():
-    assert "rate limited" in _readable(_named("RateLimitError")())
-    assert "could not reach" in _readable(_named("APIConnectionError")())
-
-
-def _named(name: str):
-    return type(name, (Exception,), {})
-
-
-class _StubClient:
-    def __init__(self, response) -> None:
-        self.messages = _StubMessages(response)
-
-
-class _StubMessages:
-    def __init__(self, response) -> None:
-        self._response = response
-
-    def create(self, **kwargs):
-        assert kwargs["model"]
-        assert kwargs["system"] is SYSTEM_PROMPT
-        return self._response
+class _Run:
+    def __init__(self, returncode, stdout, stderr):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr

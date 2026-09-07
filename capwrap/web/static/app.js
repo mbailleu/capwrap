@@ -922,7 +922,9 @@ function explainBlock(approval) {
     return `<button class="ghost small" data-explain="${approval.id}">Explain</button>`;
   }
   if (held.pending) {
-    return '<div class="explain pending">asking Claude…</div>';
+    // The explainer uses the asking agent's own harness, so the label stays
+    // agent-neutral; the result block below names the model that answered.
+    return '<div class="explain pending">asking the agent\'s model…</div>';
   }
   if (held.error) {
     return `<div class="explain error">${escapeHtml(held.error)}</div>`;
